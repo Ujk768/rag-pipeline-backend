@@ -1,0 +1,72 @@
+# Environment Variables
+.env
+.env.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+
+# Temp / Uploaded Files
+temp_*.pdf
+*.pdf
+uploads/
+
+# Model Cache (can be very large)
+.cache/
+models/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Hugging Face Cache
+~/.cache/huggingface/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
