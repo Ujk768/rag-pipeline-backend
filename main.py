@@ -4,16 +4,66 @@ import fitz  # PyMuPDF
 import torch
 import numpy as np
 import pandas as pd
+import psycopg2
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from spacy.lang.en import English
 from sentence_transformers import SentenceTransformer, util
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from pgvector.psycopg2 import register_vector
 from dotenv import load_dotenv
 import os
 
 load_dotenv()
+
+# --- CONFIGURATION ---
+HF_TOKEN = os.getenv("HF_TOKEN")
+MODEL_ID = os.getenv("MODEL_ID")
+DB_NAME = os.getenv("DB_NAME")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+HOST = os.getenv("HOST")
+PORT = os.getenv("PORT")
+USER = os.getenv("USER")
+
+
+DB_CONFIG = {
+    "dbname": DB_NAME,
+    "user": USER,
+    "password": DB_PASSWORD,
+    "host": HOST,
+    "port": PORT
+}
+
+def get_db_connection(register=True):
+    conn = psycopg2.connect(**DB_CONFIG)
+    if register:
+        # Only register if we know the extension exists
+        register_vector(conn)
+    return conn
+
+def init_db():
+    conn = get_db_connection(register=False)
+    cur = conn.cursor()
+    # 2. Create the extension
+    cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+    conn.commit()
+    
+    # 3. Now that the type exists, we can register it for this connection 
+    # so the table creation works if it uses the 'vector' type
+    register_vector(conn)
+    # 768 is the dimension for "all-mpnet-base-v2"
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS document_chunks (
+            id SERIAL PRIMARY KEY,
+            page_number INTEGER,
+            content TEXT,
+            embedding vector(768)
+        );
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()   
 
 
 # --- GLOBAL STATE ---
@@ -27,13 +77,14 @@ llm_model = None
 tokenizer = None
 nlp = None
 
-# --- CONFIGURATION ---
-HF_TOKEN = os.getenv("HF_TOKEN")
-MODEL_ID = os.getenv("MODEL_ID")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
+    print("[INFO] Init DB...")
+    init_db()
+
     """Loads models into memory when the server starts."""
     global embedding_model, llm_model, tokenizer, nlp
     
@@ -57,7 +108,7 @@ async def lifespan(app: FastAPI):
         torch_dtype=torch.float16,
         quantization_config=quantization_config,
         low_cpu_mem_usage=True,
-        device_map="auto" # <--- THIS IS THE CRITICAL FIX
+        device_map="auto"
     )
     print("[INFO] All models loaded successfully!")
     yield
@@ -173,20 +224,39 @@ def process_pdf(file_path: str, filename: str):
         print(f"[INFO] Generating embeddings for {total_chunks} chunks...")
         text_chunks = [item["sentence_chunk"] for item in raw_pages_and_text]
 
-        new_embeddings = embedding_model.encode(
-            text_chunks,
-            batch_size=32,
-            convert_to_tensor=True,
-            show_progress_bar=True
-        )
+        # new_embeddings = embedding_model.encode(
+        #     text_chunks,
+        #     batch_size=32,
+        #     convert_to_tensor=True,
+        #     show_progress_bar=True
+        # )
 
-        # Update global state
-        pages_and_chunks = raw_pages_and_text
-        embeddings_tensor = new_embeddings
+        # # Update global state
+        # pages_and_chunks = raw_pages_and_text
+        # embeddings_tensor = new_embeddings
+
+        # processing_status["status"] = "done"
+        # processing_status["chunks"] = total_chunks
+        # print(f"[INFO] Done! {total_chunks} chunks embedded and ready.")
+
+        # Generate embeddings (numpy format is easier for pgvector)
+        new_embeddings = embedding_model.encode(text_chunks, convert_to_numpy=True)
+
+        # Batch insert into Postgres
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        for i, chunk_data in enumerate(raw_pages_and_text):
+            cur.execute(
+                "INSERT INTO document_chunks (page_number, content, embedding) VALUES (%s, %s, %s)",
+                (chunk_data["page_number"], chunk_data["sentence_chunk"], new_embeddings[i])
+            )
+        
+        conn.commit()
+        cur.close()
+        conn.close()
 
         processing_status["status"] = "done"
-        processing_status["chunks"] = total_chunks
-        print(f"[INFO] Done! {total_chunks} chunks embedded and ready.")
 
     except Exception as e:
         print(f"[ERROR] Failed to process PDF: {e}")
@@ -214,25 +284,49 @@ async def upload_document(file: UploadFile = File(...), background_tasks: Backgr
 
 @app.post("/query")
 async def query_document(request: QueryRequest):
-    """Queries the processed document and generates an answer."""
-    global pages_and_chunks, embeddings_tensor
+    # """Queries the processed document and generates an answer."""
+    # global pages_and_chunks, embeddings_tensor
 
-    if embeddings_tensor is None or len(pages_and_chunks) == 0:
-        raise HTTPException(status_code=400, detail="No document uploaded or processed yet.")
+    # if embeddings_tensor is None or len(pages_and_chunks) == 0:
+    #     raise HTTPException(status_code=400, detail="No document uploaded or processed yet.")
 
-    print(f"[INFO] Searching for: {request.query}")
-    query_embedding = embedding_model.encode(request.query, convert_to_tensor=True)
+    # print(f"[INFO] Searching for: {request.query}")
+    # query_embedding = embedding_model.encode(request.query, convert_to_tensor=True)
+    query_embedding = embedding_model.encode(request.query, convert_to_numpy=True)
+
+    # 2. Vector Search in Postgres
+    conn = get_db_connection()
+    cur = conn.cursor()
     
-    # Similarity Search
-    dot_scores = util.dot_score(query_embedding, embeddings_tensor)[0]
-    scores, indices = torch.topk(dot_scores, k=5)
+    # # Similarity Search
+    # dot_scores = util.dot_score(query_embedding, embeddings_tensor)[0]
+    # scores, indices = torch.topk(dot_scores, k=10)
     
-    context_items = [pages_and_chunks[i] for i in indices]
-    context_text = "- " + "\n- ".join(item["sentence_chunk"] for item in context_items)
+    # context_items = [pages_and_chunks[i] for i in indices]
+    # context_text = "- " + "\n- ".join(item["sentence_chunk"] for item in context_items)
+
+    # Vector search in Postgres
+    # We use <=> for cosine distance (smaller is better)
+    cur.execute("""
+        SELECT page_number, content 
+        FROM document_chunks 
+        ORDER BY embedding <=> %s 
+        LIMIT 5
+    """, (query_embedding,))
+    
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="No relevant context found.")
+
+    # 3. Format context for LLM
+    context_text = "- " + "\n- ".join(row[1] for row in rows)
 
     # Build Prompt
     base_prompt = f"""Based on the following context items, please answer the query.
-    Note: interpret the query broadly, for example "macros" refers to "macronutrients".
+    Note: interpret the query broadly".
     Give yourself room to think by extracting relevant passages from the context before answering the query.
     Don't return the thinking, only return the answer.
 
@@ -271,9 +365,27 @@ async def query_document(request: QueryRequest):
     return {
         "query": request.query,
         "answer": clean_answer,
-        "sources": [{"page": item["page_number"], "text": item["sentence_chunk"][:100] + "..."} for item in context_items]
+        # 'rows' contains (page_number, content) from your SQL fetchall()
+        "sources": [{"page": row[0], "text": row[1][:100] + "..."} for row in rows]
     }
 
 @app.get("/status")
 async def get_status():
     return processing_status
+
+@app.get("/reset")
+async def reset_data():
+    global pages_and_chunks, embeddings_tensor, processing_status
+    pages_and_chunks = []
+    embeddings_tensor = None
+    processing_status = {"status": "idle", "chunks": 0}
+    
+    # Also clear the database table
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM document_chunks;")
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"message": "Data reset successfully."}
