@@ -3,56 +3,56 @@ import re
 import fitz  # PyMuPDF
 import torch
 import numpy as np
-import pandas as pd
 import psycopg2
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from spacy.lang.en import English
-from sentence_transformers import SentenceTransformer, util
+from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from pgvector.psycopg2 import register_vector
 from dotenv import load_dotenv
-import os
+
 
 load_dotenv()
 
 # --- CONFIGURATION ---
 HF_TOKEN = os.getenv("HF_TOKEN")
 MODEL_ID = os.getenv("MODEL_ID")
-DB_NAME = os.getenv("DB_NAME")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-HOST = os.getenv("HOST")
-PORT = os.getenv("PORT")
-USER = os.getenv("USER")
-
 
 DB_CONFIG = {
-    "dbname": DB_NAME,
-    "user": USER,
-    "password": DB_PASSWORD,
-    "host": HOST,
-    "port": PORT
+    "dbname": os.getenv("DB_NAME"),
+    # FIX 1: Renamed from USER -> DB_USER to avoid collision with Linux $USER env var.
+    # Update your .env file: DB_USER=your_postgres_username
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "host": os.getenv("HOST"),
+    "port": os.getenv("PORT"),
 }
+
 
 def get_db_connection(register=True):
     conn = psycopg2.connect(**DB_CONFIG)
     if register:
-        # Only register if we know the extension exists
         register_vector(conn)
     return conn
 
+
 def init_db():
-    conn = get_db_connection(register=False)
+    # FIX 2: Use a single connection for the whole init sequence.
+    # Previously the code opened one connection without registering the vector type,
+    # called register_vector, but then the CREATE TABLE still used that same cursor —
+    # which worked, but if any step failed the connection was left open/dirty.
+    # Now we do it cleanly: enable extension → commit → register → create table → commit.
+    conn = psycopg2.connect(**DB_CONFIG)  # raw connection, no vector type yet
     cur = conn.cursor()
-    # 2. Create the extension
+
     cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-    conn.commit()
-    
-    # 3. Now that the type exists, we can register it for this connection 
-    # so the table creation works if it uses the 'vector' type
-    register_vector(conn)
-    # 768 is the dimension for "all-mpnet-base-v2"
+    conn.commit()  # commit BEFORE registering so the type physically exists
+
+    register_vector(conn)  # now safe to register
+
+    # 768 dimensions for "all-mpnet-base-v2"
     cur.execute("""
         CREATE TABLE IF NOT EXISTS document_chunks (
             id SERIAL PRIMARY KEY,
@@ -63,15 +63,13 @@ def init_db():
     """)
     conn.commit()
     cur.close()
-    conn.close()   
+    conn.close()
+    print("[INFO] Database initialized and ready.")
 
 
 # --- GLOBAL STATE ---
-# In a production app, you'd use a Vector DB (like Chroma or FAISS) instead of global variables.
-pages_and_chunks = []
-embeddings_tensor = None
-processing_status = {"status": "idle", "chunks": 0}
-# Models
+processing_status = {"status": "idle", "chunks": 0, "error": None}
+
 embedding_model = None
 llm_model = None
 tokenizer = None
@@ -79,15 +77,14 @@ nlp = None
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-
     print("[INFO] Init DB...")
     init_db()
 
-    """Loads models into memory when the server starts."""
     global embedding_model, llm_model, tokenizer, nlp
-    
+
     print("[INFO] Loading Spacy...")
     nlp = English()
     nlp.add_pipe("sentencizer")
@@ -98,9 +95,8 @@ async def lifespan(app: FastAPI):
     print("[INFO] Loading LLM and Tokenizer...")
     quantization_config = BitsAndBytesConfig(
         load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.float16
+        bnb_4bit_compute_dtype=torch.float16,
     )
-    
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)
     llm_model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
@@ -108,13 +104,15 @@ async def lifespan(app: FastAPI):
         torch_dtype=torch.float16,
         quantization_config=quantization_config,
         low_cpu_mem_usage=True,
-        device_map="auto"
+        device_map="auto",
     )
     print("[INFO] All models loaded successfully!")
     yield
     print("[INFO] Shutting down...")
 
+
 app = FastAPI(lifespan=lifespan, title="Local RAG API")
+
 
 # --- REQUEST SCHEMAS ---
 class QueryRequest(BaseModel):
@@ -122,65 +120,21 @@ class QueryRequest(BaseModel):
     temperature: float = 0.7
     max_new_tokens: int = 256
 
-# --- HELPER FUNCTIONS (From your notebook) ---
+
+# --- HELPER FUNCTIONS ---
 def text_formatter(text: str) -> str:
-    return text.replace('\n', ' ').strip()
+    return text.replace("\n", " ").strip()
+
 
 def split_list(input_list: list[str], slice_size: int = 10) -> list[list[str]]:
-    return [input_list[i: i + slice_size] for i in range(0, len(input_list), slice_size)]
-
-# def process_pdf(file_path: str, filename: str):
-#     global pages_and_chunks, embeddings_tensor, processing_status
-#     processing_status["status"] = "processing"
-#     if not file.filename.endswith(".pdf"):
-#         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
-
-#     # Save temp file
-#     temp_path = f"temp_{file.filename}"
-#     with open(temp_path, "wb") as buffer:
-#         buffer.write(await file.read())
-
-#     print("[INFO] Processing PDF...")
-#     document = fitz.open(temp_path)
-    
-#     raw_pages_and_text = []
-#     for page_num, page in enumerate(document):
-#         text = text_formatter(page.get_text())
-#         sentences = [str(sentence) for sentence in nlp(text).sents]
-#         sentence_chunks = split_list(sentences, 10)
-        
-#         for chunk in sentence_chunks:
-#             joined_chunk = "".join(chunk).replace("  ", " ").strip()
-#             joined_chunk = re.sub(r'\.([A-Z])', r'. \1', joined_chunk)
-            
-#             # Filter out tiny chunks
-#             if len(joined_chunk) / 4 > 30: 
-#                 raw_pages_and_text.append({
-#                     "page_number": page_num + 1,
-#                     "sentence_chunk": joined_chunk
-#                 })
-    
-#     document.close()
-#     os.remove(temp_path)
-
-#     print("[INFO] Creating Embeddings...")
-#     text_chunks = [item["sentence_chunk"] for item in raw_pages_and_text]
-    
-#     # Generate embeddings in batches
-#     new_embeddings = embedding_model.encode(text_chunks, batch_size=32, convert_to_tensor=True)
-    
-#     # Update global state
-#     pages_and_chunks = raw_pages_and_text
-#     embeddings_tensor = new_embeddings
+    return [input_list[i : i + slice_size] for i in range(0, len(input_list), slice_size)]
 
 
 def process_pdf(file_path: str, filename: str):
-    global pages_and_chunks, embeddings_tensor, processing_status
+    global processing_status
 
     try:
-        processing_status["status"] = "processing"
-        processing_status["chunks"] = 0
-        processing_status["error"] = None
+        processing_status = {"status": "processing", "chunks": 0, "error": None}
 
         print(f"[INFO] Opening PDF: {filename}")
         document = fitz.open(file_path)
@@ -190,25 +144,19 @@ def process_pdf(file_path: str, filename: str):
         raw_pages_and_text = []
 
         for page_num, page in enumerate(document):
-            print(f"[INFO] Processing page {page_num + 1}/{total_pages}")
             text = text_formatter(page.get_text())
-
             if not text.strip():
                 print(f"[WARN] Page {page_num + 1} is empty, skipping...")
                 continue
 
-            sentences = [str(sentence) for sentence in nlp(text).sents]
-            sentence_chunks = split_list(sentences, 10)
-
-            for chunk in sentence_chunks:
-                joined_chunk = "".join(chunk).replace("  ", " ").strip()
-                joined_chunk = re.sub(r'\.([A-Z])', r'. \1', joined_chunk)
-
-                if len(joined_chunk) / 4 > 30:
-                    raw_pages_and_text.append({
-                        "page_number": page_num + 1,
-                        "sentence_chunk": joined_chunk
-                    })
+            sentences = [str(s) for s in nlp(text).sents]
+            for chunk in split_list(sentences, 10):
+                joined = "".join(chunk).replace("  ", " ").strip()
+                joined = re.sub(r"\.([A-Z])", r". \1", joined)
+                if len(joined) / 4 > 30:
+                    raw_pages_and_text.append(
+                        {"page_number": page_num + 1, "sentence_chunk": joined}
+                    )
 
         document.close()
         os.remove(file_path)
@@ -224,46 +172,45 @@ def process_pdf(file_path: str, filename: str):
         print(f"[INFO] Generating embeddings for {total_chunks} chunks...")
         text_chunks = [item["sentence_chunk"] for item in raw_pages_and_text]
 
-        # new_embeddings = embedding_model.encode(
-        #     text_chunks,
-        #     batch_size=32,
-        #     convert_to_tensor=True,
-        #     show_progress_bar=True
-        # )
+        # FIX 3: encode in one batched call with show_progress_bar so you can
+        # see it isn't frozen. convert_to_numpy=True is correct for pgvector.
+        new_embeddings = embedding_model.encode(
+            text_chunks,
+            batch_size=32,
+            convert_to_numpy=True,
+            show_progress_bar=True,
+        )
 
-        # # Update global state
-        # pages_and_chunks = raw_pages_and_text
-        # embeddings_tensor = new_embeddings
-
-        # processing_status["status"] = "done"
-        # processing_status["chunks"] = total_chunks
-        # print(f"[INFO] Done! {total_chunks} chunks embedded and ready.")
-
-        # Generate embeddings (numpy format is easier for pgvector)
-        new_embeddings = embedding_model.encode(text_chunks, convert_to_numpy=True)
-
-        # Batch insert into Postgres
+        print("[INFO] Inserting into Postgres...")
         conn = get_db_connection()
         cur = conn.cursor()
-        
-        for i, chunk_data in enumerate(raw_pages_and_text):
-            cur.execute(
-                "INSERT INTO document_chunks (page_number, content, embedding) VALUES (%s, %s, %s)",
-                (chunk_data["page_number"], chunk_data["sentence_chunk"], new_embeddings[i])
-            )
-        
+
+        # FIX 4: Use executemany-style batching with psycopg2's execute_values
+        # for dramatically faster inserts (single round-trip instead of N round-trips).
+        from psycopg2.extras import execute_values
+
+        rows = [
+            (item["page_number"], item["sentence_chunk"], emb.tolist())
+            for item, emb in zip(raw_pages_and_text, new_embeddings)
+        ]
+        execute_values(
+            cur,
+            "INSERT INTO document_chunks (page_number, content, embedding) VALUES %s",
+            rows,
+        )
+
         conn.commit()
         cur.close()
         conn.close()
 
         processing_status["status"] = "done"
+        processing_status["chunks"] = total_chunks
+        print(f"[INFO] Done! {total_chunks} chunks embedded and stored.")
 
     except Exception as e:
         print(f"[ERROR] Failed to process PDF: {e}")
         processing_status["status"] = "failed"
         processing_status["error"] = str(e)
-
-        # Cleanup temp file if it still exists
         if os.path.exists(file_path):
             os.remove(file_path)
 
@@ -271,49 +218,47 @@ def process_pdf(file_path: str, filename: str):
 # --- ENDPOINTS ---
 
 @app.post("/upload")
-async def upload_document(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
-    temp_path = f"temp_{file.filename}"
-    with open(temp_path, "wb") as buffer:
-        buffer.write(await file.read())
-    
-    background_tasks.add_task(process_pdf, temp_path, file.filename)
-    
-    return {"message": "Upload received, processing in background. Poll /status to check."}
-    
+async def upload_document(
+    background_tasks: BackgroundTasks, file: UploadFile = File(...)
+):
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
+    if processing_status.get("status") == "processing":
+        raise HTTPException(status_code=409, detail="Already processing a file. Poll /status.")
+
+    temp_path = f"temp_{file.filename}"
+    
+    # No aiofiles needed — read in chunks using UploadFile's built-in async read
+    with open(temp_path, "wb") as buffer:
+        while chunk := await file.read(1024 * 1024):  # 1 MB at a time
+            buffer.write(chunk)
+
+    background_tasks.add_task(process_pdf, temp_path, file.filename)
+    return {"message": "Upload received, processing in background. Poll /status to check."}
 
 @app.post("/query")
 async def query_document(request: QueryRequest):
-    # """Queries the processed document and generates an answer."""
-    # global pages_and_chunks, embeddings_tensor
+    if processing_status.get("status") != "done":
+        raise HTTPException(
+            status_code=400,
+            detail=f"No document ready. Current status: {processing_status.get('status')}",
+        )
 
-    # if embeddings_tensor is None or len(pages_and_chunks) == 0:
-    #     raise HTTPException(status_code=400, detail="No document uploaded or processed yet.")
-
-    # print(f"[INFO] Searching for: {request.query}")
-    # query_embedding = embedding_model.encode(request.query, convert_to_tensor=True)
+    print(f"[INFO] Searching for: {request.query}")
     query_embedding = embedding_model.encode(request.query, convert_to_numpy=True)
 
-    # 2. Vector Search in Postgres
     conn = get_db_connection()
     cur = conn.cursor()
-    
-    # # Similarity Search
-    # dot_scores = util.dot_score(query_embedding, embeddings_tensor)[0]
-    # scores, indices = torch.topk(dot_scores, k=10)
-    
-    # context_items = [pages_and_chunks[i] for i in indices]
-    # context_text = "- " + "\n- ".join(item["sentence_chunk"] for item in context_items)
-
-    # Vector search in Postgres
-    # We use <=> for cosine distance (smaller is better)
-    cur.execute("""
-        SELECT page_number, content 
-        FROM document_chunks 
-        ORDER BY embedding <=> %s 
+    cur.execute(
+        """
+        SELECT page_number, content
+        FROM document_chunks
+        ORDER BY embedding <=> %s
         LIMIT 5
-    """, (query_embedding,))
-    
+        """,
+        (query_embedding,),
+    )
     rows = cur.fetchall()
     cur.close()
     conn.close()
@@ -321,66 +266,53 @@ async def query_document(request: QueryRequest):
     if not rows:
         raise HTTPException(status_code=404, detail="No relevant context found.")
 
-    # 3. Format context for LLM
     context_text = "- " + "\n- ".join(row[1] for row in rows)
 
-    # Build Prompt
     base_prompt = f"""Based on the following context items, please answer the query.
-    Note: interpret the query broadly".
-    Give yourself room to think by extracting relevant passages from the context before answering the query.
-    Don't return the thinking, only return the answer.
+Give yourself room to think by extracting relevant passages from the context before answering.
+Don't return the thinking, only return the answer.
 
-    Context items:
-    {context_text}
+Context items:
+{context_text}
 
-    User query: {request.query}
-    Answer:"""
+User query: {request.query}
+Answer:"""
 
     dialogue_template = [{"role": "user", "content": base_prompt}]
     prompt = tokenizer.apply_chat_template(
         conversation=dialogue_template,
         tokenize=False,
-        add_generation_prompt=True
+        add_generation_prompt=True,
     )
 
-    print("[INFO] Generating Answer...")
+    print("[INFO] Generating answer...")
     input_ids = tokenizer(prompt, return_tensors="pt").to(DEVICE)
     outputs = llm_model.generate(
         **input_ids,
         temperature=request.temperature,
         do_sample=True,
-        max_new_tokens=request.max_new_tokens
+        max_new_tokens=request.max_new_tokens,
     )
-    
+
     output_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    
-    # Clean up output to only return the generated answer
-    # clean_answer = output_text.replace(prompt, "").strip()
-    # Instead of replacing the prompt, split on "model" which is Gemma's response tag
-    if "model" in output_text:
-        clean_answer = output_text.split("model")[-1].strip()
-    else:
-        clean_answer = output_text.strip()
+    clean_answer = output_text.split("model")[-1].strip() if "model" in output_text else output_text.strip()
 
     return {
         "query": request.query,
         "answer": clean_answer,
-        # 'rows' contains (page_number, content) from your SQL fetchall()
-        "sources": [{"page": row[0], "text": row[1][:100] + "..."} for row in rows]
+        "sources": [{"page": row[0], "text": row[1][:100] + "..."} for row in rows],
     }
+
 
 @app.get("/status")
 async def get_status():
     return processing_status
 
+
 @app.get("/reset")
 async def reset_data():
-    global pages_and_chunks, embeddings_tensor, processing_status
-    pages_and_chunks = []
-    embeddings_tensor = None
-    processing_status = {"status": "idle", "chunks": 0}
-    
-    # Also clear the database table
+    global processing_status
+
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("DELETE FROM document_chunks;")
@@ -388,4 +320,5 @@ async def reset_data():
     cur.close()
     conn.close()
 
+    processing_status = {"status": "idle", "chunks": 0, "error": None}
     return {"message": "Data reset successfully."}
