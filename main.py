@@ -268,9 +268,9 @@ async def query_document(request: QueryRequest):
 
     context_text = "- " + "\n- ".join(row[1] for row in rows)
 
-    base_prompt = f"""Based on the following context items, please answer the query.
-Give yourself room to think by extracting relevant passages from the context before answering.
-Don't return the thinking, only return the answer.
+    base_prompt = f"""Use the following context snippets to respond to the query.
+Take a moment to pull out the key information before answering.
+Return only the answer, not the thought process.
 
 Context items:
 {context_text}
@@ -321,4 +321,5 @@ async def reset_data():
     conn.close()
 
     processing_status = {"status": "idle", "chunks": 0, "error": None}
+
     return {"message": "Data reset successfully."}
