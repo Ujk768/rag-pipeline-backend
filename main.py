@@ -320,6 +320,7 @@ async def reset_data():
     cur.close()
     conn.close()
 
-    processing_status = {"status": "idle", "chunks": 0, "error": None}
+    processing_status = {"status": "reset db", "chunks": 0, "error": None}
 
     return {"message": "Data reset successfully."}
+
