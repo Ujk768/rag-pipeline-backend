@@ -114,7 +114,7 @@ Create a `.env` file in the project root:
 
 ```env
 HF_TOKEN=your_huggingface_token
-MODEL_ID=mistralai/Mistral-7B-Instruct-v0.3
+MODEL_ID=google/gemma-2b-it
 
 DB_NAME=your_database_name
 DB_USER=your_postgres_username     # ⚠️ Must be DB_USER, not USER (USER is a reserved Linux variable)
