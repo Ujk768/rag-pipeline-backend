@@ -232,6 +232,13 @@ curl http://localhost:8000/reset
 
 ---
 
+## Related
+
+- **Frontend:** [adaptive-rag](https://github.com/NeftalemMG/adaptive-rag)
+
+---
+
+
 ## License
 
 MIT
