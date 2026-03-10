@@ -2,7 +2,6 @@ import os
 import re
 import fitz  # PyMuPDF
 import torch
-import numpy as np
 import psycopg2
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from pydantic import BaseModel
@@ -11,8 +10,8 @@ from spacy.lang.en import English
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from pgvector.psycopg2 import register_vector
+from psycopg2.extras import execute_values
 from dotenv import load_dotenv
-
 
 load_dotenv()
 
@@ -20,45 +19,39 @@ load_dotenv()
 HF_TOKEN = os.getenv("HF_TOKEN")
 MODEL_ID = os.getenv("MODEL_ID")
 
+# Leaves headroom for prompt template + generated answer.
+# Raise this if your model has a larger context window (e.g. 28000 for 32K models).
+FULL_CONTEXT_TOKEN_LIMIT = 6000
+
 DB_CONFIG = {
     "dbname": os.getenv("DB_NAME"),
-    # FIX 1: Renamed from USER -> DB_USER to avoid collision with Linux $USER env var.
-    # Update your .env file: DB_USER=your_postgres_username
-    "user": os.getenv("DB_USER"),
+    "user": os.getenv("DB_USER"),   # Must be DB_USER in .env — USER is a reserved Linux variable
     "password": os.getenv("DB_PASSWORD"),
     "host": os.getenv("HOST"),
     "port": os.getenv("PORT"),
 }
 
 
-def get_db_connection(register=True):
+# --- DATABASE ---
+
+def get_db_connection():
     conn = psycopg2.connect(**DB_CONFIG)
-    if register:
-        register_vector(conn)
+    register_vector(conn)
     return conn
 
 
 def init_db():
-    # FIX 2: Use a single connection for the whole init sequence.
-    # Previously the code opened one connection without registering the vector type,
-    # called register_vector, but then the CREATE TABLE still used that same cursor —
-    # which worked, but if any step failed the connection was left open/dirty.
-    # Now we do it cleanly: enable extension → commit → register → create table → commit.
-    conn = psycopg2.connect(**DB_CONFIG)  # raw connection, no vector type yet
+    conn = psycopg2.connect(**DB_CONFIG)
     cur = conn.cursor()
-
     cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-    conn.commit()  # commit BEFORE registering so the type physically exists
-
-    register_vector(conn)  # now safe to register
-
-    # 768 dimensions for "all-mpnet-base-v2"
+    conn.commit()           # commit before registering so the type physically exists
+    register_vector(conn)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS document_chunks (
-            id SERIAL PRIMARY KEY,
-            page_number INTEGER,
-            content TEXT,
-            embedding vector(768)
+            id           SERIAL PRIMARY KEY,
+            page_number  INTEGER,
+            content      TEXT,
+            embedding    vector(768)
         );
     """)
     conn.commit()
@@ -68,7 +61,11 @@ def init_db():
 
 
 # --- GLOBAL STATE ---
-processing_status = {"status": "idle", "chunks": 0, "error": None}
+# full_context_pages: holds pages in memory when the document is small enough
+#   to pass directly to the LLM — no DB involved.
+# For RAG mode this is always empty; chunks live in pgvector instead.
+processing_status = {"status": "idle", "chunks": 0, "error": None, "mode": None}
+full_context_pages: list[dict] = []
 
 embedding_model = None
 llm_model = None
@@ -78,6 +75,8 @@ nlp = None
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+# --- LIFESPAN ---
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[INFO] Init DB...")
@@ -85,14 +84,14 @@ async def lifespan(app: FastAPI):
 
     global embedding_model, llm_model, tokenizer, nlp
 
-    print("[INFO] Loading Spacy...")
+    print("[INFO] Loading spaCy...")
     nlp = English()
     nlp.add_pipe("sentencizer")
 
-    print("[INFO] Loading Embedding Model...")
+    print("[INFO] Loading embedding model...")
     embedding_model = SentenceTransformer("all-mpnet-base-v2", device=DEVICE)
 
-    print("[INFO] Loading LLM and Tokenizer...")
+    print("[INFO] Loading LLM and tokenizer...")
     quantization_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.float16,
@@ -115,6 +114,7 @@ app = FastAPI(lifespan=lifespan, title="Local RAG API")
 
 
 # --- REQUEST SCHEMAS ---
+
 class QueryRequest(BaseModel):
     query: str
     temperature: float = 0.7
@@ -122,95 +122,123 @@ class QueryRequest(BaseModel):
 
 
 # --- HELPER FUNCTIONS ---
+
 def text_formatter(text: str) -> str:
     return text.replace("\n", " ").strip()
 
 
 def split_list(input_list: list[str], slice_size: int = 10) -> list[list[str]]:
-    return [input_list[i : i + slice_size] for i in range(0, len(input_list), slice_size)]
+    return [input_list[i: i + slice_size] for i in range(0, len(input_list), slice_size)]
 
+
+# --- PDF PROCESSING ---
 
 def process_pdf(file_path: str, filename: str):
-    global processing_status
+    global processing_status, full_context_pages
 
     try:
-        processing_status = {"status": "processing", "chunks": 0, "error": None}
+        processing_status = {"status": "processing", "chunks": 0, "error": None, "mode": None}
+        full_context_pages = []
 
         print(f"[INFO] Opening PDF: {filename}")
         document = fitz.open(file_path)
         total_pages = len(document)
         print(f"[INFO] PDF has {total_pages} pages")
 
-        raw_pages_and_text = []
-
+        # Extract all text up front — needed for token counting regardless of mode
+        full_text_by_page = []
         for page_num, page in enumerate(document):
-            text = text_formatter(page.get_text())
-            if not text.strip():
-                print(f"[WARN] Page {page_num + 1} is empty, skipping...")
-                continue
-
-            sentences = [str(s) for s in nlp(text).sents]
-            for chunk in split_list(sentences, 10):
-                joined = "".join(chunk).replace("  ", " ").strip()
-                joined = re.sub(r"\.([A-Z])", r". \1", joined)
-                if len(joined) / 4 > 30:
-                    raw_pages_and_text.append(
-                        {"page_number": page_num + 1, "sentence_chunk": joined}
-                    )
+            text_blocks = page.get_text("blocks")
+            # Join blocks with newlines to keep names and affiliations separate
+            text = "\n".join([block[4] for block in text_blocks])
+            if text.strip():
+                full_text_by_page.append({"page_number": page_num + 1, "text": text})
 
         document.close()
         os.remove(file_path)
 
-        total_chunks = len(raw_pages_and_text)
-        print(f"[INFO] Total chunks created: {total_chunks}")
-
-        if total_chunks == 0:
-            processing_status["status"] = "failed"
-            processing_status["error"] = "No valid text chunks found in PDF"
+        if not full_text_by_page:
+            processing_status.update({"status": "failed", "error": "No text found in PDF"})
             return
 
-        print(f"[INFO] Generating embeddings for {total_chunks} chunks...")
-        text_chunks = [item["sentence_chunk"] for item in raw_pages_and_text]
+        # Decide mode based on actual token count, not page count
+        full_text = "\n".join(p["text"] for p in full_text_by_page)
+        token_count = len(tokenizer.encode(full_text))
+        print(f"[INFO] Document token count: {token_count} (limit: {FULL_CONTEXT_TOKEN_LIMIT})")
 
-        # FIX 3: encode in one batched call with show_progress_bar so you can
-        # see it isn't frozen. convert_to_numpy=True is correct for pgvector.
-        new_embeddings = embedding_model.encode(
-            text_chunks,
-            batch_size=32,
-            convert_to_numpy=True,
-            show_progress_bar=True,
-        )
+        if token_count <= FULL_CONTEXT_TOKEN_LIMIT:
+            # ── FULL-CONTEXT MODE ──
+            # Document fits in the LLM's context window.
+            # No chunking, no embeddings, no DB — just keep pages in memory.
+            print("[INFO] Using full-context mode.")
+            full_context_pages = full_text_by_page
+            processing_status.update({
+                "status": "done",
+                "mode": "full_context",
+                "chunks": 0,
+            })
+            print(f"[INFO] Done! {len(full_text_by_page)} pages held in memory.")
 
-        print("[INFO] Inserting into Postgres...")
-        conn = get_db_connection()
-        cur = conn.cursor()
+        else:
+            # ── RAG MODE ──
+            # Document is too large for the context window.
+            # Chunk, embed, and store in pgvector for similarity search at query time.
+            print("[INFO] Using RAG mode.")
 
-        # FIX 4: Use executemany-style batching with psycopg2's execute_values
-        # for dramatically faster inserts (single round-trip instead of N round-trips).
-        from psycopg2.extras import execute_values
+            raw_pages_and_text = []
+            for page_data in full_text_by_page:
+                sentences = [str(s) for s in nlp(page_data["text"]).sents]
+                for chunk in split_list(sentences, 10):
+                    joined = "".join(chunk).replace("  ", " ").strip()
+                    joined = re.sub(r"\.([A-Z])", r". \1", joined)
+                    if joined:
+                        raw_pages_and_text.append({
+                            "page_number": page_data["page_number"],
+                            "sentence_chunk": joined,
+                        })
 
-        rows = [
-            (item["page_number"], item["sentence_chunk"], emb.tolist())
-            for item, emb in zip(raw_pages_and_text, new_embeddings)
-        ]
-        execute_values(
-            cur,
-            "INSERT INTO document_chunks (page_number, content, embedding) VALUES %s",
-            rows,
-        )
+            total_chunks = len(raw_pages_and_text)
+            print(f"[INFO] Total chunks created: {total_chunks}")
 
-        conn.commit()
-        cur.close()
-        conn.close()
+            if total_chunks == 0:
+                processing_status.update({"status": "failed", "error": "No valid chunks after splitting"})
+                return
 
-        processing_status["status"] = "done"
-        processing_status["chunks"] = total_chunks
-        print(f"[INFO] Done! {total_chunks} chunks embedded and stored.")
+            print(f"[INFO] Generating embeddings for {total_chunks} chunks...")
+            text_chunks = [item["sentence_chunk"] for item in raw_pages_and_text]
+            new_embeddings = embedding_model.encode(
+                text_chunks,
+                batch_size=32,
+                convert_to_numpy=True,
+                show_progress_bar=True,
+            )
+
+            print("[INFO] Inserting into Postgres...")
+            conn = get_db_connection()
+            cur = conn.cursor()
+            rows = [
+                (item["page_number"], item["sentence_chunk"], emb.tolist())
+                for item, emb in zip(raw_pages_and_text, new_embeddings)
+            ]
+            execute_values(
+                cur,
+                "INSERT INTO document_chunks (page_number, content, embedding) VALUES %s",
+                rows,
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+
+            processing_status.update({
+                "status": "done",
+                "mode": "rag",
+                "chunks": total_chunks,
+            })
+            print(f"[INFO] Done! {total_chunks} chunks embedded and stored.")
 
     except Exception as e:
         print(f"[ERROR] Failed to process PDF: {e}")
-        processing_status["status"] = "failed"
-        processing_status["error"] = str(e)
+        processing_status.update({"status": "failed", "error": str(e)})
         if os.path.exists(file_path):
             os.remove(file_path)
 
@@ -218,9 +246,7 @@ def process_pdf(file_path: str, filename: str):
 # --- ENDPOINTS ---
 
 @app.post("/upload")
-async def upload_document(
-    background_tasks: BackgroundTasks, file: UploadFile = File(...)
-):
+async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
@@ -228,51 +254,59 @@ async def upload_document(
         raise HTTPException(status_code=409, detail="Already processing a file. Poll /status.")
 
     temp_path = f"temp_{file.filename}"
-    
-    # No aiofiles needed — read in chunks using UploadFile's built-in async read
     with open(temp_path, "wb") as buffer:
-        while chunk := await file.read(1024 * 1024):  # 1 MB at a time
+        while chunk := await file.read(1024 * 1024):  # stream in 1 MB chunks
             buffer.write(chunk)
 
     background_tasks.add_task(process_pdf, temp_path, file.filename)
     return {"message": "Upload received, processing in background. Poll /status to check."}
 
+
 @app.post("/query")
 async def query_document(request: QueryRequest):
-    if processing_status.get("status") != "done":
+    mode = processing_status.get("mode")
+
+    if mode is None or processing_status.get("status") != "done":
         raise HTTPException(
             status_code=400,
             detail=f"No document ready. Current status: {processing_status.get('status')}",
         )
 
-    print(f"[INFO] Searching for: {request.query}")
-    query_embedding = embedding_model.encode(request.query, convert_to_numpy=True)
+    if mode == "full_context":
+        # Pages are already in memory — no DB call needed
+        if not full_context_pages:
+            raise HTTPException(status_code=404, detail="Full-context data missing from memory.")
 
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT page_number, content
-        FROM document_chunks
-        ORDER BY embedding <=> %s
-        LIMIT 5
-        """,
-        (query_embedding,),
-    )
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+        context_text = "\n\n".join(f"[Page {p['page_number']}]\n{p['text']}" for p in full_context_pages)
+        rows = [(p["page_number"], p["text"]) for p in full_context_pages]
 
-    if not rows:
-        raise HTTPException(status_code=404, detail="No relevant context found.")
+    else:
+        # RAG: embed the query and retrieve the top-5 most similar chunks
+        query_embedding = embedding_model.encode(request.query, convert_to_numpy=True)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT page_number, content
+            FROM document_chunks
+            ORDER BY embedding <=> %s
+            LIMIT 5
+        """, (query_embedding,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
 
-    context_text = "- " + "\n- ".join(row[1] for row in rows)
+        if not rows:
+            raise HTTPException(status_code=404, detail="No relevant context found.")
 
-    base_prompt = f"""Use the following context snippets to respond to the query.
-Take a moment to pull out the key information before answering.
+        context_text = ""
+        for i, row in enumerate(rows):
+            context_text += f"SOURCE {i + 1} (Page {row[0]}):\n{row[1]}\n\n"
+
+    base_prompt = f"""Think of yourself as an assistant that has read the document and is now answering questions about it.
+Using your knowledge and the context, answer the question as best you can. If you don't know the answer, say you don't know.
 Return only the answer, not the thought process.
 
-Context items:
+Context:
 {context_text}
 
 User query: {request.query}
@@ -286,12 +320,15 @@ Answer:"""
     )
 
     print("[INFO] Generating answer...")
-    input_ids = tokenizer(prompt, return_tensors="pt").to(DEVICE)
+    input_ids = tokenizer(prompt, return_tensors="pt").to(llm_model.device)
     outputs = llm_model.generate(
         **input_ids,
         temperature=request.temperature,
         do_sample=True,
         max_new_tokens=request.max_new_tokens,
+        repetition_penalty=1.1,
+        eos_token_id=tokenizer.eos_token_id,  # stop as soon as answer is complete
+        pad_token_id=tokenizer.eos_token_id,  # prevents padding warning that slows things
     )
 
     output_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -300,6 +337,7 @@ Answer:"""
     return {
         "query": request.query,
         "answer": clean_answer,
+        "mode": mode,
         "sources": [{"page": row[0], "text": row[1][:100] + "..."} for row in rows],
     }
 
@@ -311,8 +349,9 @@ async def get_status():
 
 @app.get("/reset")
 async def reset_data():
-    global processing_status
+    global processing_status, full_context_pages
 
+    # Clear pgvector chunks (RAG mode)
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("DELETE FROM document_chunks;")
@@ -320,7 +359,7 @@ async def reset_data():
     cur.close()
     conn.close()
 
-    processing_status = {"status": "reset db", "chunks": 0, "error": None}
-
+    # Clear in-memory pages (full-context mode)
+    full_context_pages = []
+    processing_status = {"status": "idle", "chunks": 0, "error": None, "mode": None}
     return {"message": "Data reset successfully."}
-
