@@ -1,5 +1,6 @@
 import os
 import re
+import math
 import fitz  # PyMuPDF
 import torch
 import numpy as np
@@ -126,9 +127,45 @@ def text_formatter(text: str) -> str:
     return text.replace("\n", " ").strip()
 
 
-def split_list(input_list: list[str], slice_size: int = 10) -> list[list[str]]:
-    return [input_list[i : i + slice_size] for i in range(0, len(input_list), slice_size)]
 
+def chunk_sentences(sentences: list[str], chunk_size: int = 20, overlap: int = 5) -> list[str]:
+    """
+    Splits a flat list of sentences into overlapping chunks.
+    
+    - Divides total sentences evenly across chunks to avoid a small trailing chunk
+    - Each chunk extends 'overlap' sentences before and after its boundaries
+    """
+    total = len(sentences)
+    
+    if total == 0:
+        return []
+    
+    # If the whole document is smaller than chunk_size, just return it as one chunk
+    if total <= chunk_size + 2 * overlap:
+        return [" ".join(sentences)]
+    
+    # Calculate number of chunks and distribute sentences evenly
+    num_chunks = math.ceil(total / chunk_size)
+    base_size = total // num_chunks
+    remainder = total % num_chunks
+
+    # Build chunk boundary indices
+    chunks = []
+    start = 0
+    for i in range(num_chunks):
+        # Distribute remainder sentences across the first few chunks
+        end = start + base_size + (1 if i < remainder else 0)
+        
+        # Apply overlap: read 'overlap' sentences before and after boundaries
+        overlap_start = max(0, start - overlap)
+        overlap_end = min(total, end + overlap)
+        
+        chunk_text = " ".join(sentences[overlap_start:overlap_end])
+        chunks.append(chunk_text)
+        
+        start = end
+    
+    return chunks
 
 def process_pdf(file_path: str, filename: str):
     global processing_status
@@ -141,27 +178,33 @@ def process_pdf(file_path: str, filename: str):
         total_pages = len(document)
         print(f"[INFO] PDF has {total_pages} pages")
 
-        raw_pages_and_text = []
+        all_sentences = []
 
         for page_num, page in enumerate(document):
             text = text_formatter(page.get_text())
             if not text.strip():
                 print(f"[WARN] Page {page_num + 1} is empty, skipping...")
                 continue
-
             sentences = [str(s) for s in nlp(text).sents]
-            for chunk in split_list(sentences, 10):
-                joined = "".join(chunk).replace("  ", " ").strip()
-                joined = re.sub(r"\.([A-Z])", r". \1", joined)
-                if len(joined) / 4 > 30:
-                    raw_pages_and_text.append(
-                        {"page_number": page_num + 1, "sentence_chunk": joined}
-                    )
+            all_sentences.extend(sentences)
 
         document.close()
         os.remove(file_path)
 
-        total_chunks = len(raw_pages_and_text)
+        print(f"[INFO] Total sentences collected: {len(all_sentences)}")
+
+        if not all_sentences:
+            processing_status["status"] = "failed"
+            processing_status["error"] = "No valid text found in PDF"
+            return
+
+        # --- Chunk across the whole document with overlap ---
+        chunks = chunk_sentences(all_sentences, chunk_size=20, overlap=5)
+
+        # --- Filter out short chunks ---
+        # chunks = [c for c in chunks if len(c) / 4 > 30] #maybe useless?
+
+        total_chunks = len(chunks)
         print(f"[INFO] Total chunks created: {total_chunks}")
 
         if total_chunks == 0:
@@ -170,12 +213,11 @@ def process_pdf(file_path: str, filename: str):
             return
 
         print(f"[INFO] Generating embeddings for {total_chunks} chunks...")
-        text_chunks = [item["sentence_chunk"] for item in raw_pages_and_text]
 
         # FIX 3: encode in one batched call with show_progress_bar so you can
         # see it isn't frozen. convert_to_numpy=True is correct for pgvector.
         new_embeddings = embedding_model.encode(
-            text_chunks,
+            chunks,
             batch_size=32,
             convert_to_numpy=True,
             show_progress_bar=True,
@@ -190,8 +232,8 @@ def process_pdf(file_path: str, filename: str):
         from psycopg2.extras import execute_values
 
         rows = [
-            (item["page_number"], item["sentence_chunk"], emb.tolist())
-            for item, emb in zip(raw_pages_and_text, new_embeddings)
+            (None, chunk, emb.tolist())
+            for chunk, emb in zip(chunks, new_embeddings)
         ]
         execute_values(
             cur,
@@ -213,7 +255,6 @@ def process_pdf(file_path: str, filename: str):
         processing_status["error"] = str(e)
         if os.path.exists(file_path):
             os.remove(file_path)
-
 
 # --- ENDPOINTS ---
 
