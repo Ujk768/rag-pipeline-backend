@@ -256,7 +256,62 @@ def prune_cosine(
 
     return kept_indices, stats
 
+# Strategy 2 - MaxSim Pruning
+def prune_maxsim(
+    embeddings: np.ndarray,
+    chunks: list[dict],
+    threshold_multiplier: float = 0.95,
+) -> tuple[list[int], dict]:
+    """
+    Prunes chunks that are highly similar to *at least one other* chunk.
 
+    Logic:
+      - For each chunk, compute its maximum cosine similarity to any other chunk.
+      - High MaxSim score → this chunk has a near-duplicate. Prune it.
+      - Low MaxSim score → this chunk is unlike everything else. Keep it.
+
+    This is the DocPruner-aligned strategy. It mirrors how MaxSim retrieval
+    works at query time: you only need one good matching vector per concept,
+    so duplicates are safe to drop without hurting recall.
+
+    O(n²) pairwise comparison — acceptable for typical document sizes.
+    """
+    n = len(embeddings)
+
+    # Full pairwise cosine similarity matrix
+    sim_matrix = cosine_similarity_matrix(embeddings, embeddings)
+
+    # Zero out diagonal (self-similarity = 1.0, not useful)
+    np.fill_diagonal(sim_matrix, 0.0)
+
+    # MaxSim score per chunk: highest similarity to any neighbour
+    scores = sim_matrix.max(axis=1)  # shape: (n,)
+
+    # Adaptive threshold: chunks above this have near-duplicates → prune
+    threshold = float(scores.mean() * threshold_multiplier)
+
+    kept_indices = [i for i, s in enumerate(scores) if s <= threshold]
+
+    if not kept_indices:
+        kept_indices = [int(np.argmin(scores))]
+
+    pruned_indices = [i for i in range(n) if i not in set(kept_indices)]
+
+    stats = _build_pruning_stats(
+        strategy="maxsim",
+        n_total=n,
+        kept_indices=kept_indices,
+        pruned_indices=pruned_indices,
+        scores=scores.tolist(),
+        threshold=threshold,
+        chunks=chunks,
+        extra={
+            "threshold_multiplier": threshold_multiplier,
+            "score_meaning": "max cosine similarity to any other chunk — higher = more redundant",
+        },
+    )
+
+    return kept_indices, stats
 
 # Strategy 3 - Cosine + Whitening Pruning
 def prune_cosine_whitened(
