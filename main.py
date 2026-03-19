@@ -9,9 +9,15 @@ from contextlib import asynccontextmanager
 from spacy.lang.en import English
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from pgvector.psycopg2 import register_vector
+from pgvector.psycopg2 import register_vector  
 from psycopg2.extras import execute_values
 from dotenv import load_dotenv
+from fastapi.middleware.cors import CORSMiddleware
+
+origins = [
+    "http://localhost:3000",   
+    "*",
+]
 
 load_dotenv()
 
@@ -92,18 +98,27 @@ async def lifespan(app: FastAPI):
     embedding_model = SentenceTransformer("all-mpnet-base-v2", device=DEVICE)
 
     print("[INFO] Loading LLM and tokenizer...")
-    quantization_config = BitsAndBytesConfig(
+
+    if DEVICE == "cpu":
+        print("[WARNING] CUDA not found. Loading LLM in full precision on CPU (Slow).")
+        quantization_config = None
+        current_device_map = None
+    else:
+        print("[INFO] CUDA found. Loading LLM with 4-bit quantization for faster inference.")
+        quantization_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.float16,
-    )
+        bnb_4bit_quant_type="nf4"
+        )
+        current_device_map = "auto"
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)
     llm_model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         token=HF_TOKEN,
-        torch_dtype=torch.float16,
         quantization_config=quantization_config,
         low_cpu_mem_usage=True,
-        device_map="auto",
+        # device_map="auto",
+        device_map=current_device_map,
     )
     print("[INFO] All models loaded successfully!")
     yield
@@ -111,7 +126,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan, title="Local RAG API")
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,            # Allows specific origins
+    allow_credentials=True,
+    allow_methods=["*"],              # Allows all methods (GET, POST, etc.)
+    allow_headers=["*"],              # Allows all headers
+)
 
 # --- REQUEST SCHEMAS ---
 

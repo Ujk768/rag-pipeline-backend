@@ -1,0 +1,15 @@
+# Keep the Docker build context lean.
+# These files are either sensitive or regenerated at runtime.
+
+.env
+*.pyc
+__pycache__/
+.git/
+.gitignore
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.pdf
+*.tmp
