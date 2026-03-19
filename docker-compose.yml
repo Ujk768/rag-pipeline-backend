@@ -1,0 +1,39 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16 
+    container_name: postgres_vector_db
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-password}
+      POSTGRES_DB: ${DB_NAME:-vector_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  api:
+    build: .
+    container_name: fastapi_rag_app
+    env_file: .env
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      HOST: db
+      DATABASE_URL: postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-password}@db:5432/${DB_NAME:-vector_db}
+    depends_on:
+      - db
+    # This section is CRITICAL for bitsandbytes/transformers to see your GPU 
+    # uncomment for mchines without gpu support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    shm_size: '2gb' 
+
+volumes:
+  postgres_data:

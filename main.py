@@ -4,31 +4,36 @@ import fitz  # PyMuPDF
 import torch
 import numpy as np
 import psycopg2
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks , Query
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from spacy.lang.en import English
 from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer, AutoModelForCausalLM # UJK - , BitsAndBytesConfig
-from pgvector.psycopg2 import register_vector
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from pgvector.psycopg2 import register_vector  
 from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 from typing import Literal, Optional
+from fastapi.middleware.cors import CORSMiddleware
+
+origins = [
+    "http://localhost:3000",   
+    "*",
+]
 
 load_dotenv()
 
-# CONFIGURATION
+# --- CONFIGURATION ---
 HF_TOKEN = os.getenv("HF_TOKEN")
 MODEL_ID = os.getenv("MODEL_ID")
 
 # Leaves headroom for prompt template + generated answer.
-# We can raise this if our model has a larger context window (e.g. 28000 for 32K models).
-# .!! See github issues - one person has to research the limits of our model
+# Raise this if your model has a larger context window (e.g. 28000 for 32K models).
 FULL_CONTEXT_TOKEN_LIMIT = 6000
 
 DB_CONFIG = {
     "dbname": os.getenv("DB_NAME"),
-    "user": os.getenv("DB_USER"), # Must be DB_USER in .env — USER is a reserved Linux variable
+    "user": os.getenv("DB_USER"),   # Must be DB_USER in .env — USER is a reserved Linux variable
     "password": os.getenv("DB_PASSWORD"),
     "host": os.getenv("HOST"),
     "port": os.getenv("PORT"),
@@ -44,15 +49,13 @@ def get_db_connection():
     register_vector(conn)
     return conn
 
+
 def init_db():
     conn = psycopg2.connect(**DB_CONFIG)
     cur = conn.cursor()
-
     cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-    conn.commit()  # commit before registering so the type physically exists
-    
+    conn.commit()           # commit before registering so the type physically exists
     register_vector(conn)
-    
     cur.execute("""
         CREATE TABLE IF NOT EXISTS document_chunks (
             id           SERIAL PRIMARY KEY,
@@ -80,17 +83,11 @@ llm_model = None
 tokenizer = None
 nlp = None
 
-# DEVICE = "cuda" if torch.cuda.is_available() else "cpu" -> UJK: Uncomment and comment out the next six lines
-
-if torch.cuda.is_available():
-    DEVICE = "cuda"
-elif torch.backends.mps.is_available():
-    DEVICE = "mps"
-else:
-    DEVICE = "cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# LIFESPAN
+# --- LIFESPAN ---
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[INFO] Init DB...")
@@ -106,38 +103,58 @@ async def lifespan(app: FastAPI):
     embedding_model = SentenceTransformer("all-mpnet-base-v2", device=DEVICE)
 
     print("[INFO] Loading LLM and tokenizer...")
-    
-    # quantization_config = BitsAndBytesConfig( -> UJK: Uncomment
-    #     load_in_4bit=True,
-    #     bnb_4bit_compute_dtype=torch.float16,
-    # )
 
+    if DEVICE == "cpu":
+        print("[WARNING] CUDA not found. Loading LLM in full precision on CPU (Slow).")
+        quantization_config = None
+        current_device_map = None
+    else:
+        print("[INFO] CUDA found. Loading LLM with 4-bit quantization for faster inference.")
+        quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_quant_type="nf4"
+        )
+        current_device_map = "auto"
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)
     llm_model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         token=HF_TOKEN,
-        torch_dtype=torch.float16,
-        # quantization_config=quantization_config, -> UJK Uncomment
+        quantization_config=quantization_config,
         low_cpu_mem_usage=True,
-        device_map={"": DEVICE}, #UJK comment this out and uncomment the next line
-        #device_map="auto", 
+        attn_implementation="sdpa",
+        # device_map="auto",
+        device_map=current_device_map,
     )
+
+    if DEVICE == "cuda":
+        print("[INFO] Compiling model for faster inference (this may take a few minutes on first run)...")
+        llm_model = torch.compile(llm_model)
+
     print("[INFO] All models loaded successfully!")
     yield
     print("[INFO] Shutting down...")
 
 
 app = FastAPI(lifespan=lifespan, title="Local RAG API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,            # Allows specific origins
+    allow_credentials=True,
+    allow_methods=["*"],              # Allows all methods (GET, POST, etc.)
+    allow_headers=["*"],              # Allows all headers
+)
 
+# --- REQUEST SCHEMAS ---
 
-# REQUEST SCHEMAS
 class QueryRequest(BaseModel):
     query: str
     temperature: float = 0.7
     max_new_tokens: int = 256
 
 
-# HELPER FUNCTIONS
+# --- HELPER FUNCTIONS ---
+
 def text_formatter(text: str) -> str:
     return text.replace("\n", " ").strip()
 
@@ -699,13 +716,14 @@ Answer:"""
     )
 
     print("[INFO] Generating answer...")
-    input_ids = tokenizer(prompt, return_tensors="pt").to(llm_model.device)
+    input_ids = tokenizer(prompt, return_tensors="pt", padding = True).to(llm_model.device)
     outputs = llm_model.generate(
         **input_ids,
         temperature=request.temperature,
         do_sample=True,
         max_new_tokens=request.max_new_tokens,
         repetition_penalty=1.1,
+        cache_implementation="static",
         eos_token_id=tokenizer.eos_token_id, # stop as soon as answer is complete
         pad_token_id=tokenizer.eos_token_id, # prevents padding warning that slows things
     )
