@@ -27,6 +27,7 @@ venv/
 env/
 ENV/
 .venv/
+ragenv/
 
 # Temp / Uploaded Files
 temp_*.pdf
