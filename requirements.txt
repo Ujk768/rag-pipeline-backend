@@ -11,10 +11,11 @@ accelerate
 # bitsandbytes // Uncomment this if you are running on a CUDA-enabled NVIDIA GPU
 jupyter
 wheel
-# flash-attn
+flash-attn
 fastapi
 python-dotenv
 python-multipart
 uvicorn
 psycopg2-binary
 pgvector
+tqdm==4.66.2
