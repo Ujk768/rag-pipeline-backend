@@ -151,8 +151,8 @@ async def lifespan(app: FastAPI):
     #     device_map={"": DEVICE},
     #     #device_map="auto", 
     # )
-    # print("[INFO] All models loaded successfully!")
-    # yield
+    print("[INFO] All models loaded successfully!")
+    yield
     # print("[INFO] Shutting down...")
 
 
