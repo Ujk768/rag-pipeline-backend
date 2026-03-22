@@ -79,7 +79,7 @@ def index_corpus(corpus, embeddings_map, strategy):
     # store doc_id in content column for retrieval mapping
     execute_values(cur,
         "INSERT INTO document_chunks (page_number, content, embedding) VALUES %s",
-        [(0, doc_id, emb) for doc_id, emb in rows]
+        [(0, doc_id, emb) for doc_id, emb in rows], template="(%s, %s, %s::vector)"
     )
     conn.commit()
     cur.close(); conn.close()
@@ -97,7 +97,7 @@ def retrieve(queries, query_embeddings, top_k=10):
         qemb_list = qemb.tolist()
         # We use cosine similarity (1 - distance)
         cur.execute("""
-            SELECT content, 1 - (embedding <=> %s) AS score
+            SELECT content, 1 - (embedding <=> %s::vector) AS score
             FROM document_chunks
             ORDER BY embedding <=> %s
             LIMIT %s
