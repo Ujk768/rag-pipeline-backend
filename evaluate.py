@@ -79,7 +79,7 @@ def index_corpus(corpus, embeddings_map, strategy):
     # store doc_id in content column for retrieval mapping
     execute_values(cur,
         "INSERT INTO document_chunks (page_number, content, embedding) VALUES %s",
-        [(0, doc_id, emb) for doc_id, emb in rows], template="(%s, %s, %s::vector)"
+        [(0, doc_id, emb) for doc_id, emb in rows]
     )
     conn.commit()
     cur.close(); conn.close()
@@ -94,14 +94,14 @@ def retrieve(queries, query_embeddings, top_k=10):
     query_ids = list(queries.keys())
     
     for qid, qemb in zip(query_ids, query_embeddings):
-        qemb_list = qemb.tolist()
+        # qemb_list = qemb.tolist()
         # We use cosine similarity (1 - distance)
         cur.execute("""
-            SELECT content, 1 - (embedding <=> %s::vector) AS score
+            SELECT content, 1 - (embedding <=> %s) AS score
             FROM document_chunks
             ORDER BY embedding <=> %s
             LIMIT %s
-        """, (qemb_list, qemb_list, top_k))
+        """, (qemb, qemb, top_k))
         
         rows = cur.fetchall()
         # BEIR expects {query_id: {doc_id: score}}
