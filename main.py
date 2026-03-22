@@ -630,6 +630,9 @@ def maxsim_rerank(
     if top_k >= n:
         return list(range(n))
 
+    # Flatten query to 1D to avoid shape mismatch
+    query_embedding = query_embedding.flatten()
+
     # Normalise
     q_norm = query_embedding / (np.linalg.norm(query_embedding) + 1e-8)
     c_norms = candidate_embeddings / (np.linalg.norm(candidate_embeddings, axis=1, keepdims=True) + 1e-8)
@@ -950,11 +953,11 @@ async def query_document(request: QueryRequest):
     
     # Using cosine distance (<=>) - pgvector returns smallest distance (most similar)
     cur.execute("""
-        SELECT content, page_number, embedding <=> %s AS distance 
-        FROM document_chunks 
-        ORDER BY distance ASC 
+        SELECT content, page_number, embedding, embedding <=> %s AS distance
+        FROM document_chunks
+        ORDER BY distance ASC
         LIMIT 20;
-    """, (query_enc, ))
+    """, (query_enc,))
     
     rows = cur.fetchall()
     cur.close()
@@ -968,7 +971,7 @@ async def query_document(request: QueryRequest):
     # but the 5 hits that are most distinct and relevant.
     if request.use_maxsim:
         # Convert rows to a format the reranker understands
-        candidate_embeddings = np.vstack([r[2] if isinstance(r[2], np.ndarray) else np.array(r[2]) for r in rows])
+        candidate_embeddings = np.vstack([np.array(r[2]) for r in rows])
         # We use your existing maxsim_rerank function or the iterative logic
         top_indices = maxsim_rerank(query_enc, candidate_embeddings, top_k=5)
         refined_context = [rows[i] for i in top_indices]
@@ -1008,7 +1011,7 @@ async def query_document(request: QueryRequest):
     return {
         "answer": answer,
         "context": [
-            {"page": r[1], "content": r[0], "score": round(1 - float(r[2]), 4)} 
+            {"page": r[1], "content": r[0], "score": round(1 - float(r[3]), 4)} 
             for r in refined_context
         ]
     }
@@ -1084,7 +1087,7 @@ async def get_stored_chunks(limit: int = Query(default=20, ge=1, le=200)):
     chunks = [
         {
             "id": int(row[0]),
-            "page_number": int(row[1]),
+            "page_number": int(row[1]) if row[1] is not None else None,
             "content": row[2],
             # pgvector returns a list of numpy.float32 — FastAPI can't serialize them.
             # Explicitly cast each element to Python float.
