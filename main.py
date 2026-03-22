@@ -968,7 +968,7 @@ async def query_document(request: QueryRequest):
     # but the 5 hits that are most distinct and relevant.
     if request.use_maxsim:
         # Convert rows to a format the reranker understands
-        candidate_embeddings = np.array([np.array(r[2]) if isinstance(r[2], list) else r[2] for r in rows])
+        candidate_embeddings = np.vstack([r[2] if isinstance(r[2], np.ndarray) else np.array(r[2]) for r in rows])
         # We use your existing maxsim_rerank function or the iterative logic
         top_indices = maxsim_rerank(query_enc, candidate_embeddings, top_k=5)
         refined_context = [rows[i] for i in top_indices]
