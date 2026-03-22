@@ -1085,7 +1085,7 @@ async def get_stored_chunks(limit: int = Query(default=20, ge=1, le=200)):
     chunks = [
         {
             "id": int(row[0]),
-            "page_number": int(row[1]),
+            "page_number": int(row[1]) if row[1] is not None else None,
             "content": row[2],
             # pgvector returns a list of numpy.float32 — FastAPI can't serialize them.
             # Explicitly cast each element to Python float.
