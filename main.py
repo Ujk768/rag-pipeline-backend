@@ -941,7 +941,7 @@ async def query_document(request: QueryRequest):
 
     # 1. Embed the user query
     query_enc = embedding_model.encode(request.query, convert_to_numpy=True)
-    query_list = query_enc.tolist()
+    # query_list = query_enc.tolist()
 
     # 2. Retrieval Phase (pgvector)
     # We fetch more candidates than we need (e.g., 20) to allow MaxSim to pick the best ones.
@@ -954,7 +954,7 @@ async def query_document(request: QueryRequest):
         FROM document_chunks 
         ORDER BY distance ASC 
         LIMIT 20;
-    """, (query_list,))
+    """, (query_enc, ))
     
     rows = cur.fetchall()
     cur.close()
