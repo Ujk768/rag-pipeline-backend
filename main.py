@@ -1010,10 +1010,12 @@ async def query_document(request: QueryRequest):
 
     return {
         "answer": answer,
-        "context": [
-            {"page": r[1], "content": r[0], "score": round(1 - float(r[3]), 4)} 
+        "mode": processing_status.get("mode"),
+        "maxsim_applied": request.use_maxsim,
+        "sources": [
+            {"page": r[1], "text": r[0][:100] + "...", "score": round(1 - float(r[3]), 4)}
             for r in refined_context
-        ]
+        ],
     }
 @app.get("/status")
 async def get_status():
