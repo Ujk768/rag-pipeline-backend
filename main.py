@@ -4,13 +4,13 @@ import fitz  # PyMuPDF
 import torch
 import numpy as np
 import psycopg2
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks , Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from spacy.lang.en import English
 from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from pgvector.psycopg2 import register_vector  
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig # Remove bitsandbytes when running on a non-GPU environment.
+from pgvector.psycopg2 import register_vector
 from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 from typing import Literal, Optional
@@ -23,24 +23,25 @@ origins = [
 
 load_dotenv()
 
-# --- CONFIGURATION ---
+# CONFIGURATION
 HF_TOKEN = os.getenv("HF_TOKEN")
 MODEL_ID = os.getenv("MODEL_ID")
 
 # Leaves headroom for prompt template + generated answer.
-# Raise this if your model has a larger context window (e.g. 28000 for 32K models).
+# We can raise this if our model has a larger context window (e.g. 28000 for 32K models).
+# .!! See github issues - one person has to research the limits of our model
 FULL_CONTEXT_TOKEN_LIMIT = 6000
 
 DB_CONFIG = {
     "dbname": os.getenv("DB_NAME"),
-    "user": os.getenv("DB_USER"),   # Must be DB_USER in .env — USER is a reserved Linux variable
+    "user": os.getenv("DB_USER"), # Must be DB_USER in .env — USER is a reserved Linux variable
     "password": os.getenv("DB_PASSWORD"),
     "host": os.getenv("HOST"),
     "port": os.getenv("PORT"),
 }
 
 # Valid pruning strategy literals — used for type checking and API docs
-PruningStrategy = Literal["none", "cosine", "maxsim", "cosine_whitened"]
+PruningStrategy = Literal["none", "cosine", "cosine_whitened", "kmeans", "mmr", "docpruner"]
 
 
 # DATABASE
@@ -49,13 +50,15 @@ def get_db_connection():
     register_vector(conn)
     return conn
 
-
 def init_db():
     conn = psycopg2.connect(**DB_CONFIG)
     cur = conn.cursor()
+
     cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-    conn.commit()           # commit before registering so the type physically exists
+    conn.commit()  # commit before registering so the type physically exists
+    
     register_vector(conn)
+    
     cur.execute("""
         CREATE TABLE IF NOT EXISTS document_chunks (
             id           SERIAL PRIMARY KEY,
@@ -73,7 +76,7 @@ def init_db():
 processing_status = {"status": "idle", "chunks": 0, "error": None, "mode": None}
 full_context_pages: list[dict] = []
 
-# Added: persistent pruning report exposed to frontend
+# Persistent pruning report exposed to frontend
 # Stores detailed stats from the most recent pruning run.
 # Reset on each new upload. Frontend polls /pruning-report to visualize results.
 pruning_report: dict = {}
@@ -85,9 +88,16 @@ nlp = None
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Use this block instead if you're on a Mac with MPS support - Comment out the line above
+# if torch.cuda.is_available():
+#     DEVICE = "cuda"
+# elif torch.backends.mps.is_available():
+#     DEVICE = "mps"
+# else:
+#     DEVICE = "cpu"
 
-# --- LIFESPAN ---
 
+# LIFESPAN
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[INFO] Init DB...")
@@ -130,13 +140,24 @@ async def lifespan(app: FastAPI):
     if DEVICE == "cuda":
         print("[INFO] Compiling model for faster inference (this may take a few minutes on first run)...")
         llm_model = torch.compile(llm_model)
-
+    
+    # Uncomment this and comment out the two ifs above if having issues with bits and bytes
+    # tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)
+    # llm_model = AutoModelForCausalLM.from_pretrained(
+    #     MODEL_ID,
+    #     token=HF_TOKEN,
+    #     torch_dtype=torch.float16,
+    #     low_cpu_mem_usage=True,
+    #     device_map="auto",
+    #     #device_map="auto", 
+    # )
     print("[INFO] All models loaded successfully!")
     yield
     print("[INFO] Shutting down...")
 
 
 app = FastAPI(lifespan=lifespan, title="Local RAG API")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,            # Allows specific origins
@@ -145,16 +166,17 @@ app.add_middleware(
     allow_headers=["*"],              # Allows all headers
 )
 
-# --- REQUEST SCHEMAS ---
 
+# REQUEST SCHEMAS
+# CHANGED: added use_maxsim flag — MaxSim is now a retrieval-side option, not an indexing strategy
 class QueryRequest(BaseModel):
     query: str
     temperature: float = 0.7
     max_new_tokens: int = 256
+    use_maxsim: bool = True  # if True, re-ranks retrieved chunks using MaxSim before answering
 
 
-# --- HELPER FUNCTIONS ---
-
+# HELPER FUNCTIONS
 def text_formatter(text: str) -> str:
     return text.replace("\n", " ").strip()
 
@@ -219,7 +241,45 @@ def cosine_similarity_matrix(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     return A_norm @ B_norm.T
 
 
-# Strategy 1 - Cosine Similarity Pruning─
+def prune_docpruner(
+    embeddings: np.ndarray,
+    chunks: list[dict],
+    k_factor: float = 0.5, # Controls aggressiveness: higher = more pruning
+) -> tuple[list[int], dict]:
+    n = len(embeddings)
+    centroid = embeddings.mean(axis=0, keepdims=True)
+    scores = cosine_similarity_matrix(embeddings, centroid).flatten()
+
+    # τ = μ + (k * σ)
+    mu = np.mean(scores)
+    sigma = np.std(scores)
+    threshold = float(mu + (k_factor * sigma))
+
+    # KEEP chunks ABOVE the threshold (the most representative ones)
+    kept_indices = [i for i, s in enumerate(scores) if s >= threshold]
+
+    if not kept_indices:
+        kept_indices = [int(np.argmax(scores))]
+
+    pruned_indices = [i for i in range(n) if i not in set(kept_indices)]
+
+    stats = _build_pruning_stats(
+        strategy="docpruner",
+        n_total=n,
+        kept_indices=kept_indices,
+        pruned_indices=pruned_indices,
+        scores=scores.tolist(),
+        threshold=threshold,
+        chunks=chunks,
+        extra={
+            "k_factor": k_factor,
+            "score_meaning": "similarity to doc centroid — higher means more core information",
+        },
+    )
+    return kept_indices, stats
+
+
+# Strategy 1 - Cosine Similarity Pruning
 def prune_cosine(
     embeddings: np.ndarray,
     chunks: list[dict],
@@ -273,64 +333,8 @@ def prune_cosine(
 
     return kept_indices, stats
 
-# Strategy 2 - MaxSim Pruning
-def prune_maxsim(
-    embeddings: np.ndarray,
-    chunks: list[dict],
-    threshold_multiplier: float = 0.95,
-) -> tuple[list[int], dict]:
-    """
-    Prunes chunks that are highly similar to *at least one other* chunk.
 
-    Logic:
-      - For each chunk, compute its maximum cosine similarity to any other chunk.
-      - High MaxSim score → this chunk has a near-duplicate. Prune it.
-      - Low MaxSim score → this chunk is unlike everything else. Keep it.
-
-    This is the DocPruner-aligned strategy. It mirrors how MaxSim retrieval
-    works at query time: you only need one good matching vector per concept,
-    so duplicates are safe to drop without hurting recall.
-
-    O(n²) pairwise comparison — acceptable for typical document sizes.
-    """
-    n = len(embeddings)
-
-    # Full pairwise cosine similarity matrix
-    sim_matrix = cosine_similarity_matrix(embeddings, embeddings)
-
-    # Zero out diagonal (self-similarity = 1.0, not useful)
-    np.fill_diagonal(sim_matrix, 0.0)
-
-    # MaxSim score per chunk: highest similarity to any neighbour
-    scores = sim_matrix.max(axis=1)  # shape: (n,)
-
-    # Adaptive threshold: chunks above this have near-duplicates → prune
-    threshold = float(scores.mean() * threshold_multiplier)
-
-    kept_indices = [i for i, s in enumerate(scores) if s <= threshold]
-
-    if not kept_indices:
-        kept_indices = [int(np.argmin(scores))]
-
-    pruned_indices = [i for i in range(n) if i not in set(kept_indices)]
-
-    stats = _build_pruning_stats(
-        strategy="maxsim",
-        n_total=n,
-        kept_indices=kept_indices,
-        pruned_indices=pruned_indices,
-        scores=scores.tolist(),
-        threshold=threshold,
-        chunks=chunks,
-        extra={
-            "threshold_multiplier": threshold_multiplier,
-            "score_meaning": "max cosine similarity to any other chunk — higher = more redundant",
-        },
-    )
-
-    return kept_indices, stats
-
-# Strategy 3 - Cosine + Whitening Pruning
+# Strategy 2 - Cosine + Whitening Pruning
 def prune_cosine_whitened(
     embeddings: np.ndarray,
     chunks: list[dict],
@@ -392,6 +396,271 @@ def prune_cosine_whitened(
     )
 
     return kept_indices, stats
+
+
+# ADDED: Strategy 3 - K-Means Clustering Based Selection
+def prune_kmeans(
+    embeddings: np.ndarray,
+    chunks: list[dict],
+    n_clusters: int = None,
+) -> tuple[list[int], dict]:
+    """
+    K-Means clustering based representative selection.
+
+    Instead of scoring individual vectors against a centroid or each other,
+    this strategy clusters all document embeddings into K groups and keeps
+    the one chunk per cluster that is closest to its cluster centroid.
+
+    Why this is more principled than cosine pruning:
+      - Cosine pruning compares everything to one global average point,
+        which ignores the actual topical structure of the document.
+      - K-Means respects the real distribution — if a document covers
+        3 distinct topics, 3 clusters naturally emerge, and we keep one
+        representative per topic.
+      - K maps directly onto the project's cost-based framing:
+        K is the storage budget. You decide how many vectors you can afford,
+        and the algorithm finds the best K representatives for that budget.
+
+    n_clusters defaults to sqrt(n) if not specified — a common heuristic
+    that scales the budget with document size.
+    """
+    from sklearn.cluster import KMeans
+
+    n = len(embeddings)
+
+    if n_clusters is None:
+        n_clusters = max(1, int(n * 0.5))  # Keep 50% instead of sqrt(n)
+
+    # Edge case: if n_clusters >= n, just keep everything
+    if n_clusters >= n:
+        kept_indices = list(range(n))
+        pruned_indices = []
+        scores = [0.0] * n
+        threshold = 0.0
+    else:
+        kmeans = KMeans(n_clusters=n_clusters, init="k-means++", n_init=5, random_state=42)
+        labels = kmeans.fit_predict(embeddings)
+        centroids = kmeans.cluster_centers_  # shape: (n_clusters, d)
+
+        # For each cluster, find the chunk closest to its centroid
+        # Score = cosine distance to assigned centroid (lower = better representative)
+        scores = []
+        for i, emb in enumerate(embeddings):
+            centroid = centroids[labels[i]]
+            cos_sim = float(
+                np.dot(emb, centroid) / (np.linalg.norm(emb) * np.linalg.norm(centroid) + 1e-8)
+            )
+            scores.append(1.0 - cos_sim)  # convert to distance: lower = closer to centroid
+
+        # Keep the chunk with the lowest distance (best representative) per cluster
+        kept_indices = []
+        for cluster_id in range(n_clusters):
+            members = [i for i, lbl in enumerate(labels) if lbl == cluster_id]
+            if members:
+                best = min(members, key=lambda i: scores[i])
+                kept_indices.append(best)
+
+        kept_indices = sorted(kept_indices)
+        pruned_indices = [i for i in range(n) if i not in set(kept_indices)]
+        threshold = float(np.mean(scores))
+
+    stats = _build_pruning_stats(
+        strategy="kmeans",
+        n_total=n,
+        kept_indices=kept_indices,
+        pruned_indices=pruned_indices,
+        scores=scores,
+        threshold=threshold,
+        chunks=chunks,
+        extra={
+            "n_clusters": n_clusters,
+            "score_meaning": "cosine distance to assigned cluster centroid — lower = better representative",
+            "selection_rule": "one chunk per cluster — the closest to its centroid is kept",
+        },
+    )
+
+    return kept_indices, stats
+
+
+# ADDED: Strategy 4 - Maximal Marginal Relevance (MMR)
+def prune_mmr(
+    embeddings: np.ndarray,
+    chunks: list[dict],
+    target_k: int = None,
+    lambda_param: float = 0.5,
+) -> tuple[list[int], dict]:
+    """
+    Maximal Marginal Relevance (MMR) representative selection.
+
+    MMR selects vectors iteratively. At each step, the next vector chosen
+    must maximise a trade-off between:
+      - Relevance: similarity to the document centroid (coverage)
+      - Diversity: dissimilarity to already-selected vectors (novelty)
+
+    Score = lambda * sim_to_centroid - (1 - lambda) * max_sim_to_selected
+
+    lambda=1.0 → pure relevance (greedy, similar to cosine pruning)
+    lambda=0.0 → pure diversity (maximally spread out)
+    lambda=0.5 → balanced coverage + diversity (default)
+
+    Why this fits the project:
+      - It explicitly balances what a good representative sketch needs:
+        you want vectors that cover the document's content AND don't
+        duplicate each other. No other strategy does both simultaneously.
+      - target_k is your cost parameter — you directly control how many
+        vectors get stored, just like K in K-Means.
+      - This is probably the most directly applicable strategy to the
+        cost-based representative selection framing in the project brief.
+    """
+    n = len(embeddings)
+
+    # Default target_k: same heuristic as kmeans
+    if target_k is None:
+        target_k = max(1, int(n * 0.5))
+
+    if target_k >= n:
+        kept_indices = list(range(n))
+        pruned_indices = []
+        scores = [1.0] * n
+        threshold = 0.0
+    else:
+        # Normalise embeddings once for efficient cosine similarity
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8
+        normed = embeddings / norms
+
+        # Document centroid (relevance anchor)
+        centroid = normed.mean(axis=0)
+        centroid = centroid / (np.linalg.norm(centroid) + 1e-8)
+
+        # Relevance scores: cosine similarity of each chunk to centroid
+        relevance = normed @ centroid  # shape: (n,)
+
+        selected = []
+        remaining = list(range(n))
+
+        # MMR iterative selection
+        while len(selected) < target_k and remaining:
+            if not selected:
+                # First pick: most relevant to centroid
+                best = max(remaining, key=lambda i: relevance[i])
+            else:
+                # Subsequent picks: balance relevance vs similarity to already-selected
+                selected_embs = normed[selected]  # shape: (len(selected), d)
+
+                best_score = -np.inf
+                best = remaining[0]
+                for i in remaining:
+                    sim_to_centroid = relevance[i]
+                    sim_to_selected = float((normed[i] @ selected_embs.T).max())
+                    mmr_score = lambda_param * sim_to_centroid - (1 - lambda_param) * sim_to_selected
+                    if mmr_score > best_score:
+                        best_score = mmr_score
+                        best = i
+
+            selected.append(best)
+            remaining.remove(best)
+
+        kept_indices = sorted(selected)
+        pruned_indices = [i for i in range(n) if i not in set(kept_indices)]
+
+        # Scores: relevance to centroid (for reporting — higher = more representative)
+        scores = relevance.tolist()
+        threshold = float(np.mean(scores))
+
+    stats = _build_pruning_stats(
+        strategy="mmr",
+        n_total=n,
+        kept_indices=kept_indices,
+        pruned_indices=pruned_indices,
+        scores=scores,
+        threshold=threshold,
+        chunks=chunks,
+        extra={
+            "target_k": target_k,
+            "lambda_param": lambda_param,
+            "score_meaning": "cosine similarity to document centroid — used as relevance signal in MMR",
+            "selection_rule": f"iterative MMR with lambda={lambda_param} — balances coverage and diversity",
+        },
+    )
+
+    return kept_indices, stats
+
+def calculate_maxsim_score(query_vec, doc_vectors):
+    """
+    Score a document by its 'best match' vector. 
+    This is the core of Late Interaction (DocPruner/ColBERT).
+    """
+    # query_vec shape: (768,)
+    # doc_vectors shape: (num_kept_chunks, 768)
+    norms = np.linalg.norm(doc_vectors, axis=1) + 1e-8
+    q_norm = query_vec / (np.linalg.norm(query_vec) + 1e-8)
+    
+    # Cosine similarities for all kept chunks in the doc
+    similarities = (doc_vectors @ q_norm) / norms
+    
+    # Return the maximum similarity found
+    return float(np.max(similarities))
+
+# ADDED: MaxSim re-ranking for retrieval side
+
+# After pgvector returns the top-N candidates by cosine distance, MaxSim re-ranks them
+# by selecting the subset whose collective coverage of the query is maximised.
+# This keeps MaxSim's diversity benefit without touching what gets stored in the DB.
+def maxsim_rerank(
+    query_embedding: np.ndarray,
+    candidate_embeddings: np.ndarray,
+    top_k: int = 5,
+) -> list[int]:
+    """
+    MaxSim re-ranking at retrieval time.
+
+    Selects top_k candidates from a pool using the same iterative
+    diversity logic that was previously applied at index time, but now
+    applied to the small retrieval candidate set (e.g. top-20 from pgvector).
+
+    For each selection step, we pick the candidate that has the highest
+    maximum similarity to any query token — i.e. the one most likely to
+    contain a direct answer to some part of the query.
+
+    In practice with sentence-level embeddings (not token-level like ColBERT),
+    this reduces to: pick candidates that are diverse relative to each other
+    while still being relevant to the query.
+    """
+    n = len(candidate_embeddings)
+    if top_k >= n:
+        return list(range(n))
+
+    # Flatten query to 1D to avoid shape mismatch
+    query_embedding = query_embedding.flatten()
+
+    # Normalise
+    q_norm = query_embedding / (np.linalg.norm(query_embedding) + 1e-8)
+    c_norms = candidate_embeddings / (np.linalg.norm(candidate_embeddings, axis=1, keepdims=True) + 1e-8)
+
+    # Relevance to query
+    relevance = c_norms @ q_norm  # shape: (n,)
+
+    selected = []
+    remaining = list(range(n))
+
+    while len(selected) < top_k and remaining:
+        if not selected:
+            best = max(remaining, key=lambda i: relevance[i])
+        else:
+            sel_embs = c_norms[selected]
+            best_score = -np.inf
+            best = remaining[0]
+            for i in remaining:
+                rel = relevance[i]
+                redundancy = float((c_norms[i] @ sel_embs.T).max())
+                score = rel - 0.5 * redundancy  # fixed lambda=0.5 for retrieval
+                if score > best_score:
+                    best_score = score
+                    best = i
+        selected.append(best)
+        remaining.remove(best)
+
+    return selected
 
 
 # Shared stats builder — produces the full pruning report
@@ -548,14 +817,23 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
             if pruning_strategy != "none" and total_chunks > 1:
                 print(f"[INFO] Applying pruning strategy: {pruning_strategy}")
 
+                # CHANGED: dispatch block updated — maxsim removed, kmeans and mmr added
                 if pruning_strategy == "cosine":
                     kept_indices, report = prune_cosine(new_embeddings, raw_pages_and_text)
 
-                elif pruning_strategy == "maxsim":
-                    kept_indices, report = prune_maxsim(new_embeddings, raw_pages_and_text)
-
                 elif pruning_strategy == "cosine_whitened":
                     kept_indices, report = prune_cosine_whitened(new_embeddings, raw_pages_and_text)
+
+                elif pruning_strategy == "kmeans":
+                    # ADDED: K-Means dispatch
+                    kept_indices, report = prune_kmeans(new_embeddings, raw_pages_and_text)
+
+                elif pruning_strategy == "mmr":
+                    # ADDED: MMR dispatch
+                    kept_indices, report = prune_mmr(new_embeddings, raw_pages_and_text)
+                elif pruning_strategy == "docpruner":
+                    # NEW: The actual DocPruner implementation
+                    kept_indices, report = prune_docpruner(new_embeddings, raw_pages_and_text)
 
                 else:
                     report = {"strategy": "none", "summary": {"total_chunks": total_chunks}}
@@ -627,15 +905,16 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
 async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    # ADDED: pruning_strategy query param — default "none" preserves existing behaviour
+    # CHANGED: pruning_strategy literal updated — maxsim removed, kmeans and mmr added
     pruning_strategy: PruningStrategy = Query(
         default="none",
         description=(
             "Pruning strategy to apply before storing embeddings. "
             "'none': store all chunks. "
             "'cosine': prune chunks too close to centroid. "
-            "'maxsim': prune chunks that have near-duplicates. "
-            "'cosine_whitened': cosine pruning on whitened embedding space (most discriminative)."
+            "'cosine_whitened': cosine pruning on whitened embedding space (most discriminative). "
+            "'kmeans': cluster embeddings into K groups, keep one representative per cluster. "
+            "'mmr': iterative selection balancing relevance and diversity (Maximal Marginal Relevance)."
         ),
     ),
 ):
@@ -660,84 +939,84 @@ async def upload_document(
 
 @app.post("/query")
 async def query_document(request: QueryRequest):
-    mode = processing_status.get("mode")
+    if not embedding_model or not llm_model:
+        raise HTTPException(status_code=503, detail="Models not loaded")
 
-    if mode is None or processing_status.get("status") != "done":
-        raise HTTPException(
-            status_code=400,
-            detail=f"No document ready. Current status: {processing_status.get('status')}",
+    # 1. Embed the user query
+    query_enc = embedding_model.encode(request.query, convert_to_numpy=True)
+    # query_list = query_enc.tolist()
+
+    # 2. Retrieval Phase (pgvector)
+    # We fetch more candidates than we need (e.g., 20) to allow MaxSim to pick the best ones.
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # Using cosine distance (<=>) - pgvector returns smallest distance (most similar)
+    cur.execute("""
+        SELECT content, page_number, embedding, embedding <=> %s AS distance
+        FROM document_chunks
+        ORDER BY distance ASC
+        LIMIT 20;
+    """, (query_enc,))
+    
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    if not rows:
+        return {"answer": "I couldn't find any relevant information in the document.", "context": []}
+
+    # 3. MaxSim / Reranking Phase
+    # If use_maxsim is True, we ensure we aren't just taking the first 5 hits,
+    # but the 5 hits that are most distinct and relevant.
+    if request.use_maxsim:
+        # Convert rows to a format the reranker understands
+        candidate_embeddings = np.vstack([np.array(r[2]) for r in rows])
+        # We use your existing maxsim_rerank function or the iterative logic
+        top_indices = maxsim_rerank(query_enc, candidate_embeddings, top_k=5)
+        refined_context = [rows[i] for i in top_indices]
+    else:
+        # Standard Top-5 retrieval
+        refined_context = rows[:5]
+
+    # 4. Construct the Prompt
+    context_text = "\n\n".join([f"[Page {r[1]}]: {r[0]}" for r in refined_context])
+    
+    prompt = f"""
+    You are a helpful assistant answering questions based on the provided document.
+    Use ONLY the context below to answer. If the answer isn't there, say you don't know.
+
+    CONTEXT:
+    {context_text}
+
+    QUESTION: {request.query}
+    ANSWER:"""
+
+    # 5. LLM Generation
+    inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
+    
+    with torch.no_grad():
+        output_tokens = llm_model.generate(
+            **inputs,
+            max_new_tokens=request.max_new_tokens,
+            temperature=request.temperature,
+            do_sample=True if request.temperature > 0 else False,
+            pad_token_id=tokenizer.eos_token_id
         )
 
-    if mode == "full_context":
-        # Pages are already in memory — no DB call needed
-        if not full_context_pages:
-            raise HTTPException(status_code=404, detail="Full-context data missing from memory.")
-        
-        context_text = "\n\n".join(f"[Page {p['page_number']}]\n{p['text']}" for p in full_context_pages)
-        rows = [(p["page_number"], p["text"]) for p in full_context_pages]
-    
-    else:
-        # RAG: embed the query and retrieve the top-5 most similar chunks
-        query_embedding = embedding_model.encode(request.query, convert_to_numpy=True)
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT page_number, content
-            FROM document_chunks
-            ORDER BY embedding <=> %s
-            LIMIT 5
-        """, (query_embedding,))
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-
-        if not rows:
-            raise HTTPException(status_code=404, detail="No relevant context found.")
-        context_text = ""
-
-        for i, row in enumerate(rows):
-            context_text += f"SOURCE {i + 1} (Page {row[0]}):\n{row[1]}\n\n"
-
-    base_prompt = f"""Think of yourself as an assistant that has read the document and is now answering questions about it.
-Using your knowledge and the context, answer the question as best you can. If you don't know the answer, say you don't know.
-Return only the answer, not the thought process.
-
-Context:
-{context_text}
-
-User query: {request.query}
-Answer:"""
-
-    dialogue_template = [{"role": "user", "content": base_prompt}]
-    prompt = tokenizer.apply_chat_template(
-        conversation=dialogue_template,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-    print("[INFO] Generating answer...")
-    input_ids = tokenizer(prompt, return_tensors="pt", padding = True).to(llm_model.device)
-    outputs = llm_model.generate(
-        **input_ids,
-        temperature=request.temperature,
-        do_sample=True,
-        max_new_tokens=request.max_new_tokens,
-        repetition_penalty=1.1,
-        cache_implementation="static",
-        eos_token_id=tokenizer.eos_token_id, # stop as soon as answer is complete
-        pad_token_id=tokenizer.eos_token_id, # prevents padding warning that slows things
-    )
-    output_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    clean_answer = output_text.split("model")[-1].strip() if "model" in output_text else output_text.strip()
+    full_answer = tokenizer.decode(output_tokens[0], skip_special_tokens=True)
+    # Clean up the prompt from the answer if necessary
+    answer = full_answer.split("ANSWER:")[-1].strip()
 
     return {
-        "query": request.query,
-        "answer": clean_answer,
-        "mode": mode,
-        "sources": [{"page": row[0], "text": row[1][:100] + "..."} for row in rows],
+        "answer": answer,
+        "mode": processing_status.get("mode"),
+        "maxsim_applied": request.use_maxsim,
+        "sources": [
+            {"page": r[1], "text": r[0][:100] + "...", "score": round(1 - float(r[3]), 4)}
+            for r in refined_context
+        ],
     }
-
-
 @app.get("/status")
 async def get_status():
     return processing_status
@@ -755,6 +1034,75 @@ async def get_pruning_report():
             detail="No pruning report available. Upload a document with a pruning strategy first.",
         )
     return pruning_report
+
+
+@app.get("/chunks")
+async def get_stored_chunks(limit: int = Query(default=20, ge=1, le=200)):
+    """
+    Returns the chunks currently stored in pgvector, including their full
+    embedding vectors. Used by the dev-mode frontend to render real vector
+    heat-maps and confirm what actually survived pruning.
+ 
+    Query params:
+      limit (int, 1-200, default 20) — max chunks to return.
+ 
+    Returns:
+      mode        : "rag" | "full_context" — current processing mode
+      total       : total rows currently in document_chunks
+      chunks      : list of {id, page_number, content, embedding}
+    """
+    mode = processing_status.get("mode")
+ 
+    if mode == "full_context":
+        # No vectors stored — return pages as pseudo-chunks without embeddings
+        return {
+            "mode": "full_context",
+            "total": len(full_context_pages),
+            "chunks": [
+                {
+                    "id": i + 1,
+                    "page_number": p["page_number"],
+                    "content": p["text"][:500],
+                    "embedding": [],   # no embedding in full-context mode
+                }
+                for i, p in enumerate(full_context_pages[:limit])
+            ],
+        }
+ 
+    # RAG mode — fetch from pgvector
+    conn = get_db_connection()
+    cur = conn.cursor()
+ 
+    # Total count
+    cur.execute("SELECT COUNT(*) FROM document_chunks;")
+    total = cur.fetchone()[0]
+ 
+    # Fetch rows including the raw embedding vector
+    cur.execute(
+        "SELECT id, page_number, content, embedding FROM document_chunks ORDER BY id LIMIT %s;",
+        (limit,),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+ 
+    chunks = [
+        {
+            "id": int(row[0]),
+            "page_number": int(row[1]) if row[1] is not None else None,
+            "content": row[2],
+            # pgvector returns a list of numpy.float32 — FastAPI can't serialize them.
+            # Explicitly cast each element to Python float.
+            "embedding": [float(v) for v in row[3]],
+        }
+        for row in rows
+    ]
+ 
+    return {
+        "mode": "rag",
+        "total": total,
+        "chunks": chunks,
+    }
 
 
 @app.get("/reset")
