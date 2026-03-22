@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 import os, json
 
 # your existing pruning functions imported from main
-from main import prune_cosine, prune_cosine_whitened, prune_kmeans, prune_mmr
+from main import prune_cosine, prune_cosine_whitened, prune_kmeans, prune_mmr, prune_docpruner
 
 load_dotenv()
 
@@ -21,7 +21,7 @@ DB_CONFIG = {
     "port": os.getenv("PORT"),
 }
 
-STRATEGIES = ["none", "cosine", "cosine_whitened", "kmeans", "mmr"]
+STRATEGIES = ["none", "cosine", "cosine_whitened", "kmeans", "mmr", "docpruner"]
 
 def get_conn():
     conn = psycopg2.connect(**DB_CONFIG)
@@ -41,18 +41,33 @@ def index_corpus(corpus, embeddings_map, strategy):
     
     doc_ids = list(corpus.keys())
     all_embeddings = np.array([embeddings_map[doc_id] for doc_id in doc_ids])
-    chunks = [{"page_number": 0, "sentence_chunk": corpus[doc_id]["text"]} for doc_id in doc_ids]
+    # Mock chunks for the pruning functions
+    chunks = [{"page_number": 0, "sentence_chunk": ""} for _ in doc_ids]
 
+    # --- FIX STARTS HERE ---
     if strategy == "none" or len(doc_ids) <= 1:
         kept_indices = list(range(len(doc_ids)))
-    elif strategy == "cosine":
-        kept_indices, _ = prune_cosine(all_embeddings, chunks)
-    elif strategy == "cosine_whitened":
-        kept_indices, _ = prune_cosine_whitened(all_embeddings, chunks)
+    
+    elif strategy == "docpruner":
+        # Using k_factor=0.0 keeps roughly 50% based on the mean
+        kept_indices, _ = prune_docpruner(all_embeddings, chunks, k_factor=0.0)
+
     elif strategy == "kmeans":
-        kept_indices, _ = prune_kmeans(all_embeddings, chunks)
+        # Force a 50% budget for the test instead of sqrt(n)
+        kept_indices, _ = prune_kmeans(all_embeddings, chunks, n_clusters=int(len(doc_ids) * 0.5))
+
     elif strategy == "mmr":
-        kept_indices, _ = prune_mmr(all_embeddings, chunks)
+        # Force a 50% budget for the test
+        kept_indices, _ = prune_mmr(all_embeddings, chunks, target_k=int(len(doc_ids) * 0.5))
+    
+    elif strategy in ["cosine", "cosine_whitened"]:
+        # Ensure these are using the "flipped" logic (keeping high similarity)
+        # if you updated them in main.py. 
+        # For now, let's use your existing imports:
+        if strategy == "cosine":
+            kept_indices, _ = prune_cosine(all_embeddings, chunks)
+        else:
+            kept_indices, _ = prune_cosine_whitened(all_embeddings, chunks)
 
     conn = get_conn()
     cur = conn.cursor()
@@ -71,20 +86,29 @@ def index_corpus(corpus, embeddings_map, strategy):
     return len(kept_indices), len(doc_ids)
 
 def retrieve(queries, query_embeddings, top_k=10):
-    """Retrieve top-k doc_ids per query from pgvector."""
     results = {}
     conn = get_conn()
     cur = conn.cursor()
-    for qid, qemb in zip(queries.keys(), query_embeddings):
+    
+    # query_ids allows us to map the loop correctly
+    query_ids = list(queries.keys())
+    
+    for qid, qemb in zip(query_ids, query_embeddings):
+        qemb_list = qemb.tolist()
+        # We use cosine similarity (1 - distance)
         cur.execute("""
             SELECT content, 1 - (embedding <=> %s) AS score
             FROM document_chunks
             ORDER BY embedding <=> %s
             LIMIT %s
-        """, (qemb, qemb, top_k))
+        """, (qemb_list, qemb_list, top_k))
+        
         rows = cur.fetchall()
-        results[qid] = {doc_id: float(score) for doc_id, score in rows}
-    cur.close(); conn.close()
+        # BEIR expects {query_id: {doc_id: score}}
+        results[qid] = {row[0]: float(row[1]) for row in rows}
+        
+    cur.close()
+    conn.close()
     return results
 
 def main():

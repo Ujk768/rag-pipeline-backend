@@ -41,7 +41,7 @@ DB_CONFIG = {
 }
 
 # Valid pruning strategy literals — used for type checking and API docs
-PruningStrategy = Literal["none", "cosine", "cosine_whitened", "kmeans", "mmr"]
+PruningStrategy = Literal["none", "cosine", "cosine_whitened", "kmeans", "mmr", "docpruner"]
 
 
 # DATABASE
@@ -173,7 +173,7 @@ class QueryRequest(BaseModel):
     query: str
     temperature: float = 0.7
     max_new_tokens: int = 256
-    use_maxsim: bool = False  # if True, re-ranks retrieved chunks using MaxSim before answering
+    use_maxsim: bool = True  # if True, re-ranks retrieved chunks using MaxSim before answering
 
 
 # HELPER FUNCTIONS
@@ -239,6 +239,44 @@ def cosine_similarity_matrix(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     B_norm = B / (np.linalg.norm(B, axis=1, keepdims=True) + 1e-8)
     
     return A_norm @ B_norm.T
+
+
+def prune_docpruner(
+    embeddings: np.ndarray,
+    chunks: list[dict],
+    k_factor: float = 0.5, # Controls aggressiveness: higher = more pruning
+) -> tuple[list[int], dict]:
+    n = len(embeddings)
+    centroid = embeddings.mean(axis=0, keepdims=True)
+    scores = cosine_similarity_matrix(embeddings, centroid).flatten()
+
+    # τ = μ + (k * σ)
+    mu = np.mean(scores)
+    sigma = np.std(scores)
+    threshold = float(mu + (k_factor * sigma))
+
+    # KEEP chunks ABOVE the threshold (the most representative ones)
+    kept_indices = [i for i, s in enumerate(scores) if s >= threshold]
+
+    if not kept_indices:
+        kept_indices = [int(np.argmax(scores))]
+
+    pruned_indices = [i for i in range(n) if i not in set(kept_indices)]
+
+    stats = _build_pruning_stats(
+        strategy="docpruner",
+        n_total=n,
+        kept_indices=kept_indices,
+        pruned_indices=pruned_indices,
+        scores=scores.tolist(),
+        threshold=threshold,
+        chunks=chunks,
+        extra={
+            "k_factor": k_factor,
+            "score_meaning": "similarity to doc centroid — higher means more core information",
+        },
+    )
+    return kept_indices, stats
 
 
 # Strategy 1 - Cosine Similarity Pruning
@@ -390,9 +428,8 @@ def prune_kmeans(
 
     n = len(embeddings)
 
-    # Default: sqrt(n) clusters, capped at n (can't have more clusters than chunks)
     if n_clusters is None:
-        n_clusters = max(1, min(int(np.sqrt(n)), n))
+        n_clusters = max(1, int(n * 0.5))  # Keep 50% instead of sqrt(n)
 
     # Edge case: if n_clusters >= n, just keep everything
     if n_clusters >= n:
@@ -479,7 +516,7 @@ def prune_mmr(
 
     # Default target_k: same heuristic as kmeans
     if target_k is None:
-        target_k = max(1, min(int(np.sqrt(n)), n))
+        target_k = max(1, int(n * 0.5))
 
     if target_k >= n:
         kept_indices = list(range(n))
@@ -548,6 +585,21 @@ def prune_mmr(
 
     return kept_indices, stats
 
+def calculate_maxsim_score(query_vec, doc_vectors):
+    """
+    Score a document by its 'best match' vector. 
+    This is the core of Late Interaction (DocPruner/ColBERT).
+    """
+    # query_vec shape: (768,)
+    # doc_vectors shape: (num_kept_chunks, 768)
+    norms = np.linalg.norm(doc_vectors, axis=1) + 1e-8
+    q_norm = query_vec / (np.linalg.norm(query_vec) + 1e-8)
+    
+    # Cosine similarities for all kept chunks in the doc
+    similarities = (doc_vectors @ q_norm) / norms
+    
+    # Return the maximum similarity found
+    return float(np.max(similarities))
 
 # ADDED: MaxSim re-ranking for retrieval side
 
@@ -776,6 +828,9 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
                 elif pruning_strategy == "mmr":
                     # ADDED: MMR dispatch
                     kept_indices, report = prune_mmr(new_embeddings, raw_pages_and_text)
+                elif pruning_strategy == "docpruner":
+                    # NEW: The actual DocPruner implementation
+                    kept_indices, report = prune_docpruner(new_embeddings, raw_pages_and_text)
 
                 else:
                     report = {"strategy": "none", "summary": {"total_chunks": total_chunks}}
@@ -881,99 +936,82 @@ async def upload_document(
 
 @app.post("/query")
 async def query_document(request: QueryRequest):
-    mode = processing_status.get("mode")
+    if not embedding_model or not llm_model:
+        raise HTTPException(status_code=503, detail="Models not loaded")
 
-    if mode is None or processing_status.get("status") != "done":
-        raise HTTPException(
-            status_code=400,
-            detail=f"No document ready. Current status: {processing_status.get('status')}",
+    # 1. Embed the user query
+    query_enc = embedding_model.encode(request.query, convert_to_numpy=True)
+    query_list = query_enc.tolist()
+
+    # 2. Retrieval Phase (pgvector)
+    # We fetch more candidates than we need (e.g., 20) to allow MaxSim to pick the best ones.
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # Using cosine distance (<=>) - pgvector returns smallest distance (most similar)
+    cur.execute("""
+        SELECT content, page_number, embedding <=> %s AS distance 
+        FROM document_chunks 
+        ORDER BY distance ASC 
+        LIMIT 20;
+    """, (query_list,))
+    
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    if not rows:
+        return {"answer": "I couldn't find any relevant information in the document.", "context": []}
+
+    # 3. MaxSim / Reranking Phase
+    # If use_maxsim is True, we ensure we aren't just taking the first 5 hits,
+    # but the 5 hits that are most distinct and relevant.
+    if request.use_maxsim:
+        # Convert rows to a format the reranker understands
+        candidate_embeddings = np.array([np.array(r[2]) if isinstance(r[2], list) else r[2] for r in rows])
+        # We use your existing maxsim_rerank function or the iterative logic
+        top_indices = maxsim_rerank(query_enc, candidate_embeddings, top_k=5)
+        refined_context = [rows[i] for i in top_indices]
+    else:
+        # Standard Top-5 retrieval
+        refined_context = rows[:5]
+
+    # 4. Construct the Prompt
+    context_text = "\n\n".join([f"[Page {r[1]}]: {r[0]}" for r in refined_context])
+    
+    prompt = f"""
+    You are a helpful assistant answering questions based on the provided document.
+    Use ONLY the context below to answer. If the answer isn't there, say you don't know.
+
+    CONTEXT:
+    {context_text}
+
+    QUESTION: {request.query}
+    ANSWER:"""
+
+    # 5. LLM Generation
+    inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
+    
+    with torch.no_grad():
+        output_tokens = llm_model.generate(
+            **inputs,
+            max_new_tokens=request.max_new_tokens,
+            temperature=request.temperature,
+            do_sample=True if request.temperature > 0 else False,
+            pad_token_id=tokenizer.eos_token_id
         )
 
-    if mode == "full_context":
-        # Pages are already in memory — no DB call needed
-        if not full_context_pages:
-            raise HTTPException(status_code=404, detail="Full-context data missing from memory.")
-        
-        context_text = "\n\n".join(f"[Page {p['page_number']}]\n{p['text']}" for p in full_context_pages)
-        rows = [(p["page_number"], p["text"]) for p in full_context_pages]
-    
-    else:
-        # RAG: embed the query and retrieve the top candidates from pgvector
-        query_embedding = embedding_model.encode(request.query, convert_to_numpy=True)
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        # CHANGED: fetch a larger candidate pool when use_maxsim=True so re-ranking has room to work
-        # With maxsim=False we fetch 5 directly. With maxsim=True we fetch 20 then re-rank to 5.
-        fetch_limit = 20 if request.use_maxsim else 5
-        cur.execute("""
-            SELECT page_number, content, embedding
-            FROM document_chunks
-            ORDER BY embedding <=> %s
-            LIMIT %s
-        """, (query_embedding, fetch_limit))
-        raw_rows = cur.fetchall()
-        cur.close()
-        conn.close()
-
-        if not raw_rows:
-            raise HTTPException(status_code=404, detail="No relevant context found.")
-
-        # ADDED: MaxSim re-ranking at retrieval time (only when use_maxsim=True)
-        # This is where MaxSim belongs — it re-ranks the candidate pool to maximise
-        # query coverage and diversity, without affecting what's stored in the index.
-        if request.use_maxsim and len(raw_rows) > 5:
-            candidate_embeddings = np.array([np.array(r[2]) for r in raw_rows])
-            top_indices = maxsim_rerank(query_embedding, candidate_embeddings, top_k=5)
-            rows = [(raw_rows[i][0], raw_rows[i][1]) for i in top_indices]
-        else:
-            rows = [(r[0], r[1]) for r in raw_rows[:5]]
-
-        context_text = ""
-        for i, row in enumerate(rows):
-            context_text += f"SOURCE {i + 1} (Page {row[0]}):\n{row[1]}\n\n"
-
-    base_prompt = f"""Think of yourself as an assistant that has read the document and is now answering questions about it.
-Using your knowledge and the context, answer the question as best you can. If you don't know the answer, say you don't know.
-Return only the answer, not the thought process.
-
-Context:
-{context_text}
-
-User query: {request.query}
-Answer:"""
-
-    dialogue_template = [{"role": "user", "content": base_prompt}]
-    prompt = tokenizer.apply_chat_template(
-        conversation=dialogue_template,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-    print("[INFO] Generating answer...")
-    input_ids = tokenizer(prompt, return_tensors="pt").to(llm_model.device)
-    outputs = llm_model.generate(
-        **input_ids,
-        temperature=request.temperature,
-        do_sample=True,
-        max_new_tokens=request.max_new_tokens,
-        repetition_penalty=1.1,
-        eos_token_id=tokenizer.eos_token_id, # stop as soon as answer is complete
-        pad_token_id=tokenizer.eos_token_id, # prevents padding warning that slows things
-    )
-    output_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    clean_answer = output_text.split("model")[-1].strip() if "model" in output_text else output_text.strip()
+    full_answer = tokenizer.decode(output_tokens[0], skip_special_tokens=True)
+    # Clean up the prompt from the answer if necessary
+    answer = full_answer.split("ANSWER:")[-1].strip()
 
     return {
-        "query": request.query,
-        "answer": clean_answer,
-        "mode": mode,
-        # CHANGED: added maxsim_applied flag to response so frontend can show which retrieval method was used
-        "maxsim_applied": request.use_maxsim and mode == "rag",
-        "sources": [{"page": row[0], "text": row[1][:100] + "..."} for row in rows],
+        "answer": answer,
+        "context": [
+            {"page": r[1], "content": r[0], "score": round(1 - float(r[2]), 4)} 
+            for r in refined_context
+        ]
     }
-
-
 @app.get("/status")
 async def get_status():
     return processing_status
