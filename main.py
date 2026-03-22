@@ -1,4 +1,5 @@
 import os
+import math
 import re
 import fitz  # PyMuPDF
 import torch
@@ -180,9 +181,45 @@ class QueryRequest(BaseModel):
 def text_formatter(text: str) -> str:
     return text.replace("\n", " ").strip()
 
+def chunk_sentences(sentences: list[str], chunk_size: int = 20, overlap: int = 5) -> list[str]:
+    """
+    Splits a flat list of sentences into overlapping chunks.
+    
+    - Divides total sentences evenly across chunks to avoid a small trailing chunk
+    - Each chunk extends 'overlap' sentences before and after its boundaries
+    """
+    total = len(sentences)
+    
+    if total == 0:
+        return []
+    
+    # If the whole document is smaller than chunk_size, just return it as one chunk
+    if total <= chunk_size + 2 * overlap:
+        return [" ".join(sentences)]
+    
+    # Calculate number of chunks and distribute sentences evenly
+    num_chunks = math.ceil(total / chunk_size)
+    base_size = total // num_chunks
+    remainder = total % num_chunks
 
-def split_list(input_list: list[str], slice_size: int = 10) -> list[list[str]]:
-    return [input_list[i: i + slice_size] for i in range(0, len(input_list), slice_size)]
+    # Build chunk boundary indices
+    chunks = []
+    start = 0
+    for i in range(num_chunks):
+        # Distribute remainder sentences across the first few chunks
+        end = start + base_size + (1 if i < remainder else 0)
+        
+        # Apply overlap: read 'overlap' sentences before and after boundaries
+        overlap_start = max(0, start - overlap)
+        overlap_end = min(total, end + overlap)
+        
+        chunk_text = " ".join(sentences[overlap_start:overlap_end])
+        chunks.append(chunk_text)
+        
+        start = end
+    
+    return chunks
+
 
 
 # ADDED: PRUNING STRATEGY IMPLEMENTATIONS
@@ -722,17 +759,19 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
             # Document is too large for the context window.
             # Chunk, embed, and store in pgvector for similarity search at query time.
             print("[INFO] Using RAG mode.")
-            raw_pages_and_text = []
+            all_sentences = []
             for page_data in full_text_by_page:
                 sentences = [str(s) for s in nlp(page_data["text"]).sents]
-                for chunk in split_list(sentences, 10):
-                    joined = "".join(chunk).replace("  ", " ").strip()
-                    joined = re.sub(r"\.([A-Z])", r". \1", joined)
-                    if joined:
-                        raw_pages_and_text.append({
-                            "page_number": page_data["page_number"],
-                            "sentence_chunk": joined,
-                        })
+                all_sentences.extend(sentences)
+
+            print(f"[INFO] Total sentences collected: {len(all_sentences)}")
+
+            chunked_texts = chunk_sentences(all_sentences, chunk_size=10, overlap=2)
+            raw_pages_and_text = [
+                {"page_number": None, "sentence_chunk": chunk}
+                for chunk in chunked_texts
+            ]
+
 
             total_chunks = len(raw_pages_and_text)
             print(f"[INFO] Total chunks created: {total_chunks}")
