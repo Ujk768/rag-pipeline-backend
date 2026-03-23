@@ -148,12 +148,12 @@ async def lifespan(app: FastAPI):
     #     token=HF_TOKEN,
     #     torch_dtype=torch.float16,
     #     low_cpu_mem_usage=True,
-    #     device_map={"": DEVICE},
+    #     device_map="auto",
     #     #device_map="auto", 
     # )
     print("[INFO] All models loaded successfully!")
     yield
-    # print("[INFO] Shutting down...")
+    print("[INFO] Shutting down...")
 
 
 app = FastAPI(lifespan=lifespan, title="Local RAG API")
