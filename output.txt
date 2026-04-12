@@ -1,0 +1,125 @@
+--- Strategy: none ---
+Indexed 5183/5183 docs (100.0% kept)
+nDCG@10: 0.6557 | Recall@10: 0.7901
+
+--- Strategy: cosine ---
+Indexed 1564/5183 docs (30.2% kept)
+nDCG@10: 0.2404 | Recall@10: 0.2809
+
+--- Strategy: cosine_whitened ---
+Indexed 2582/5183 docs (49.8% kept)
+nDCG@10: 0.3017 | Recall@10: 0.3652
+
+--- Strategy: kmeans ---
+Indexed 71/5183 docs (1.4% kept)
+nDCG@10: 0.0144 | Recall@10: 0.0175
+
+--- Strategy: mmr ---
+Indexed 71/5183 docs (1.4% kept)
+nDCG@10: 0.0187 | Recall@10: 0.0183
+
+
+===== RESULTS =====
+Strategy             nDCG@10      Recall@10    Stored     Storage%
+-----------------------------------------------------------------
+Indexed 2582/5183 docs (49.8% kept)
+nDCG@10: 0.3017 | Recall@10: 0.3652
+
+--- Strategy: kmeans ---
+Indexed 71/5183 docs (1.4% kept)
+nDCG@10: 0.0144 | Recall@10: 0.0175
+
+--- Strategy: mmr ---
+Indexed 71/5183 docs (1.4% kept)
+nDCG@10: 0.0187 | Recall@10: 0.0183
+
+
+===== RESULTS =====
+Strategy             nDCG@10      Recall@10    Stored     Storage%
+Indexed 2582/5183 docs (49.8% kept)
+nDCG@10: 0.3017 | Recall@10: 0.3652
+
+--- Strategy: kmeans ---
+Indexed 71/5183 docs (1.4% kept)
+nDCG@10: 0.0144 | Recall@10: 0.0175
+
+--- Strategy: mmr ---
+Indexed 71/5183 docs (1.4% kept)
+nDCG@10: 0.0187 | Recall@10: 0.0183
+
+
+===== RESULTS =====
+Indexed 2582/5183 docs (49.8% kept)
+nDCG@10: 0.3017 | Recall@10: 0.3652
+
+--- Strategy: kmeans ---
+Indexed 71/5183 docs (1.4% kept)
+nDCG@10: 0.0144 | Recall@10: 0.0175
+
+--- Strategy: mmr ---
+Indexed 71/5183 docs (1.4% kept)
+nDCG@10: 0.0187 | Recall@10: 0.0183
+
+Indexed 2582/5183 docs (49.8% kept)
+nDCG@10: 0.3017 | Recall@10: 0.3652
+
+--- Strategy: kmeans ---
+Indexed 71/5183 docs (1.4% kept)
+nDCG@10: 0.0144 | Recall@10: 0.0175
+
+--- Strategy: mmr ---
+Indexed 71/5183 docs (1.4% kept)
+nDCG@10: 0.0187 | Recall@10: 0.0183
+Indexed 2582/5183 docs (49.8% kept)
+nDCG@10: 0.3017 | Recall@10: 0.3652
+
+--- Strategy: kmeans ---
+Indexed 71/5183 docs (1.4% kept)
+nDCG@10: 0.0144 | Recall@10: 0.0175
+
+--- Strategy: mmr ---
+Indexed 2582/5183 docs (49.8% kept)
+nDCG@10: 0.3017 | Recall@10: 0.3652
+
+--- Strategy: kmeans ---
+Indexed 71/5183 docs (1.4% kept)
+nDCG@10: 0.0144 | Recall@10: 0.0175
+Indexed 2582/5183 docs (49.8% kept)
+nDCG@10: 0.3017 | Recall@10: 0.3652
+
+--- Strategy: kmeans ---
+Indexed 71/5183 docs (1.4% kept)
+Indexed 2582/5183 docs (49.8% kept)
+nDCG@10: 0.3017 | Recall@10: 0.3652
+Indexed 2582/5183 docs (49.8% kept)
+Indexed 2582/5183 docs (49.8% kept)
+nDCG@10: 0.3017 | Recall@10: 0.3652
+Indexed 2582/5183 docs (49.8% kept)
+nDCG@10: 0.3017 | Recall@10: 0.3652
+Indexed 2582/5183 docs (49.8% kept)
+nDCG@10: 0.3017 | Recall@10: 0.3652
+
+nDCG@10: 0.3017 | Recall@10: 0.3652
+
+
+--- Strategy: kmeans ---
+Indexed 71/5183 docs (1.4% kept)
+nDCG@10: 0.0144 | Recall@10: 0.0175
+
+--- Strategy: mmr ---
+--- Strategy: mmr ---
+Indexed 71/5183 docs (1.4% kept)
+Indexed 71/5183 docs (1.4% kept)
+nDCG@10: 0.0187 | Recall@10: 0.0183
+
+
+===== RESULTS =====
+Strategy             nDCG@10      Recall@10    Stored     Storage%
+-----------------------------------------------------------------
+none                 0.6557       0.7901       5183       100.0%
+cosine               0.2404       0.2809       1564       30.2%
+cosine_whitened      0.3017       0.3652       2582       49.8%
+kmeans               0.0144       0.0175       71         1.4%
+mmr                  0.0187       0.0183       71         1.4%
+
+Saved to beir_results.json

@@ -1,0 +1,37 @@
+{
+  "none": {
+    "ndcg@10": 0.3331,
+    "recall@10": 0.1665,
+    "docs_stored": 3633,
+    "total_docs": 3633,
+    "storage_pct": 100.0
+  },
+  "cosine": {
+    "ndcg@10": 0.1467,
+    "recall@10": 0.0534,
+    "docs_stored": 1049,
+    "total_docs": 3633,
+    "storage_pct": 28.9
+  },
+  "cosine_whitened": {
+    "ndcg@10": 0.2569,
+    "recall@10": 0.1092,
+    "docs_stored": 1856,
+    "total_docs": 3633,
+    "storage_pct": 51.1
+  },
+  "kmeans": {
+    "ndcg@10": 0.0425,
+    "recall@10": 0.0065,
+    "docs_stored": 60,
+    "total_docs": 3633,
+    "storage_pct": 1.7
+  },
+  "mmr": {
+    "ndcg@10": 0.0449,
+    "recall@10": 0.0221,
+    "docs_stored": 60,
+    "total_docs": 3633,
+    "storage_pct": 1.7
+  }
+}
