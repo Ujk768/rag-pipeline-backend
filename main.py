@@ -1,7 +1,6 @@
 import os
 import re
 import fitz  # PyMuPDF
-import torch
 import numpy as np
 import psycopg2
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query
@@ -9,12 +8,12 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from spacy.lang.en import English
 from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig # Remove bitsandbytes when running on a non-GPU environment.
-from pgvector.psycopg2 import register_vector
+from pgvector.psycopg2 import register_vector  
 from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 from typing import Literal, Optional
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
 
 origins = [
     "http://localhost:3000",   
@@ -26,6 +25,7 @@ load_dotenv()
 # CONFIGURATION
 HF_TOKEN = os.getenv("HF_TOKEN")
 MODEL_ID = os.getenv("MODEL_ID")
+LLM_API_KEY = os.getenv("LLM_API_KEY")
 
 # Leaves headroom for prompt template + generated answer.
 # We can raise this if our model has a larger context window (e.g. 28000 for 32K models).
@@ -81,21 +81,10 @@ full_context_pages: list[dict] = []
 # Reset on each new upload. Frontend polls /pruning-report to visualize results.
 pruning_report: dict = {}
 
-embedding_model = None
 llm_model = None
 tokenizer = None
-nlp = None
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# Use this block instead if you're on a Mac with MPS support - Comment out the line above
-# if torch.cuda.is_available():
-#     DEVICE = "cuda"
-# elif torch.backends.mps.is_available():
-#     DEVICE = "mps"
-# else:
-#     DEVICE = "cpu"
-
+DEVICE = "cpu"
 
 # LIFESPAN
 @asynccontextmanager
@@ -103,7 +92,7 @@ async def lifespan(app: FastAPI):
     print("[INFO] Init DB...")
     init_db()
 
-    global embedding_model, llm_model, tokenizer, nlp
+    global embedding_model,nlp
 
     print("[INFO] Loading spaCy...")
     nlp = English()
@@ -111,49 +100,8 @@ async def lifespan(app: FastAPI):
 
     print("[INFO] Loading embedding model...")
     embedding_model = SentenceTransformer("all-mpnet-base-v2", device=DEVICE)
-
-    print("[INFO] Loading LLM and tokenizer...")
-
-    if DEVICE == "cpu":
-        print("[WARNING] CUDA not found. Loading LLM in full precision on CPU (Slow).")
-        quantization_config = None
-        current_device_map = None
-    else:
-        print("[INFO] CUDA found. Loading LLM with 4-bit quantization for faster inference.")
-        quantization_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_quant_type="nf4"
-        )
-        current_device_map = "auto"
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)
-    llm_model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        token=HF_TOKEN,
-        quantization_config=quantization_config,
-        low_cpu_mem_usage=True,
-        attn_implementation="sdpa",
-        # device_map="auto",
-        device_map=current_device_map,
-    )
-
-    if DEVICE == "cuda":
-        print("[INFO] Compiling model for faster inference (this may take a few minutes on first run)...")
-        llm_model = torch.compile(llm_model)
-    
-    # Uncomment this and comment out the two ifs above if having issues with bits and bytes
-    # tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)
-    # llm_model = AutoModelForCausalLM.from_pretrained(
-    #     MODEL_ID,
-    #     token=HF_TOKEN,
-    #     torch_dtype=torch.float16,
-    #     low_cpu_mem_usage=True,
-    #     device_map="auto",
-    #     #device_map="auto", 
-    # )
-    print("[INFO] All models loaded successfully!")
-    yield
     print("[INFO] Shutting down...")
+    yield
 
 
 app = FastAPI(lifespan=lifespan, title="Local RAG API")
@@ -701,8 +649,8 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
         
         # Decide mode based on actual token count, not page count
         full_text = "\n".join(p["text"] for p in full_text_by_page)
-        token_count = len(tokenizer.encode(full_text))
-        print(f"[INFO] Document token count: {token_count} (limit: {FULL_CONTEXT_TOKEN_LIMIT})")
+        token_count = len(full_text) // 4  # ~4 chars per token approximation
+        print(f"[INFO] Approx token count: {token_count} (limit: {FULL_CONTEXT_TOKEN_LIMIT})")
 
         if token_count <= FULL_CONTEXT_TOKEN_LIMIT:
             # FULL-CONTEXT MODE
@@ -722,9 +670,10 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
             # Document is too large for the context window.
             # Chunk, embed, and store in pgvector for similarity search at query time.
             print("[INFO] Using RAG mode.")
+            page_texts = [p["text"] for p in full_text_by_page]
             raw_pages_and_text = []
-            for page_data in full_text_by_page:
-                sentences = [str(s) for s in nlp(page_data["text"]).sents]
+            for page_data, doc in zip(full_text_by_page, nlp.pipe(page_texts, batch_size=50)):
+                sentences = [str(s) for s in doc.sents]
                 for chunk in split_list(sentences, 10):
                     joined = "".join(chunk).replace("  ", " ").strip()
                     joined = re.sub(r"\.([A-Z])", r". \1", joined)
@@ -745,7 +694,7 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
             text_chunks = [item["sentence_chunk"] for item in raw_pages_and_text]
             new_embeddings = embedding_model.encode(
                 text_chunks,
-                batch_size=32,
+                batch_size=64,  # up from 32
                 convert_to_numpy=True,
                 show_progress_bar=True,
             )
@@ -840,6 +789,25 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
         if os.path.exists(file_path):
             os.remove(file_path)
 
+# --- LLM CALL ---
+async def call_openrouter(prompt: str, temperature: float, max_new_tokens: int) -> str:
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {LLM_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": os.getenv("OPENROUTER_MODEL", "openrouter/free"),
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": temperature,
+                "max_tokens": max_new_tokens,
+            },
+            timeout=60.0,
+        )
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
 
 # ENDPOINTS
 
@@ -890,13 +858,11 @@ async def query_document(request: QueryRequest):
         )
 
     if mode == "full_context":
-        # Pages are already in memory — no DB call needed
         if not full_context_pages:
             raise HTTPException(status_code=404, detail="Full-context data missing from memory.")
-        
         context_text = "\n\n".join(f"[Page {p['page_number']}]\n{p['text']}" for p in full_context_pages)
         rows = [(p["page_number"], p["text"]) for p in full_context_pages]
-    
+
     else:
         # RAG: embed the query and retrieve the top candidates from pgvector
         query_embedding = embedding_model.encode(request.query, convert_to_numpy=True)
@@ -933,9 +899,10 @@ async def query_document(request: QueryRequest):
         for i, row in enumerate(rows):
             context_text += f"SOURCE {i + 1} (Page {row[0]}):\n{row[1]}\n\n"
 
-    base_prompt = f"""Think of yourself as an assistant that has read the document and is now answering questions about it.
-Using your knowledge and the context, answer the question as best you can. If you don't know the answer, say you don't know.
-Return only the answer, not the thought process.
+    # Both branches converge here
+    base_prompt = f"""You are an assistant that has read a document and answers questions about it.
+Using the context below, answer the question. If you don't know, say so.
+Return only the answer.
 
 Context:
 {context_text}
@@ -943,26 +910,7 @@ Context:
 User query: {request.query}
 Answer:"""
 
-    dialogue_template = [{"role": "user", "content": base_prompt}]
-    prompt = tokenizer.apply_chat_template(
-        conversation=dialogue_template,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-    print("[INFO] Generating answer...")
-    input_ids = tokenizer(prompt, return_tensors="pt").to(llm_model.device)
-    outputs = llm_model.generate(
-        **input_ids,
-        temperature=request.temperature,
-        do_sample=True,
-        max_new_tokens=request.max_new_tokens,
-        repetition_penalty=1.1,
-        eos_token_id=tokenizer.eos_token_id, # stop as soon as answer is complete
-        pad_token_id=tokenizer.eos_token_id, # prevents padding warning that slows things
-    )
-    output_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    clean_answer = output_text.split("model")[-1].strip() if "model" in output_text else output_text.strip()
+    clean_answer = await call_openrouter(base_prompt, request.temperature, request.max_new_tokens)
 
     return {
         "query": request.query,
@@ -972,7 +920,6 @@ Answer:"""
         "maxsim_applied": request.use_maxsim and mode == "rag",
         "sources": [{"page": row[0], "text": row[1][:100] + "..."} for row in rows],
     }
-
 
 @app.get("/status")
 async def get_status():
