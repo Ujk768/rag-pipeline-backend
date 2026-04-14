@@ -86,7 +86,7 @@ def init_db():
             id           SERIAL PRIMARY KEY,
             page_number  INTEGER,
             content      TEXT,
-            embedding    vector(768)
+            embedding    vector(384)
         );
     """)
     conn.commit()
@@ -120,7 +120,7 @@ async def lifespan(app: FastAPI):
     nlp.add_pipe("sentencizer")
 
     print("[INFO] Loading embedding model...")
-    embedding_model = SentenceTransformer("all-mpnet-base-v2", device=DEVICE)
+    embedding_model = SentenceTransformer("all-MiniLM-L6-v2", device=DEVICE)
     print("[INFO] Shutting down...")
     yield
 
