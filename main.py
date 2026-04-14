@@ -812,7 +812,8 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
 # --- LLM CALL ---
 async def call_openrouter(prompt: str, temperature: float, max_new_tokens: int) -> str:
     async with httpx.AsyncClient() as client:
-        response = await client.post(
+        try:
+            response = await client.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {LLM_API_KEY}",
@@ -826,8 +827,19 @@ async def call_openrouter(prompt: str, temperature: float, max_new_tokens: int) 
             },
             timeout=60.0,
         )
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
+            if response.status_code != 200:
+                error_data = response.json()
+                error_msg = error_data.get("error", {}).get("message", "Unknown LLM Error")
+                print(f"[ERROR] LLM API Failed: {error_msg}")
+                # Return a friendly error instead of crashing
+                return f"LLM Error: {error_msg}"
+            data = response.json()
+            print(data)
+            return data["choices"][0]["message"]["content"]
+        except Exception as e:
+                print(f"[CRITICAL] LLM Call Crashed: {e}")
+                return "The AI is currently unavailable."
+        
 
 # ENDPOINTS
 
