@@ -14,10 +14,12 @@ from dotenv import load_dotenv
 from typing import Literal, Optional
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
+import json
 
 origins = [
-    "http://localhost:3000",   
+    "https://adaptive-rag.vercel.app/",
     "*",
+    "http://localhost:3000",   
 ]
 
 load_dotenv()
@@ -26,6 +28,8 @@ load_dotenv()
 HF_TOKEN = os.getenv("HF_TOKEN")
 MODEL_ID = os.getenv("MODEL_ID")
 LLM_API_KEY = os.getenv("LLM_API_KEY")
+DATA_BASE_URL = os.getenv("DATA_BASE_URL")
+print("DATA_BASE_URL from .env:", DATA_BASE_URL)
 
 # Leaves headroom for prompt template + generated answer.
 # We can raise this if our model has a larger context window (e.g. 28000 for 32K models).
@@ -46,19 +50,38 @@ PruningStrategy = Literal["none", "cosine", "cosine_whitened", "kmeans", "mmr"]
 
 # DATABASE
 def get_db_connection():
-    conn = psycopg2.connect(**DB_CONFIG)
+    # conn = psycopg2.connect(**DB_CONFIG)
+    conn = psycopg2.connect(DATA_BASE_URL, sslmode="require",connect_timeout=5)
     register_vector(conn)
     return conn
 
 def init_db():
-    conn = psycopg2.connect(**DB_CONFIG)
+    # Connect using the URL with SSL for Neon
+    conn = psycopg2.connect(DATA_BASE_URL, sslmode="require", connect_timeout=5)
     cur = conn.cursor()
 
+    # 1. Enable pgvector
     cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-    conn.commit()  # commit before registering so the type physically exists
+    conn.commit()  # Commit so the 'vector' type is recognized by the DB
     
     register_vector(conn)
+    # 2. Create the Status Table (Infrastructure)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS app_status (
+            id SERIAL PRIMARY KEY,
+            key TEXT UNIQUE,
+            value TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    # Seed the status if it's empty (prevents errors on first run)
+    cur.execute("""
+        INSERT INTO app_status (key, value) 
+        VALUES ('processing_status', '{"status": "idle", "chunks": 0, "error": None, "mode": None}')
+        ON CONFLICT (key) DO NOTHING;
+    """)
     
+    # 3. Create the Data Table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS document_chunks (
             id           SERIAL PRIMARY KEY,
@@ -70,8 +93,7 @@ def init_db():
     conn.commit()
     cur.close()
     conn.close()
-    print("[INFO] Database initialized and ready.")
-
+    print("[INFO] Database initialized, status tracking ready.")
 # GLOBAL STATE
 processing_status = {"status": "idle", "chunks": 0, "error": None, "mode": None}
 full_context_pages: list[dict] = []
@@ -131,7 +153,6 @@ def text_formatter(text: str) -> str:
 
 def split_list(input_list: list[str], slice_size: int = 10) -> list[list[str]]:
     return [input_list[i: i + slice_size] for i in range(0, len(input_list), slice_size)]
-
 
 # ADDED: PRUNING STRATEGY IMPLEMENTATIONS
 #
@@ -847,15 +868,41 @@ async def upload_document(
     }
 
 
+def has_stored_data() -> bool:
+    """Checks if there are any embeddings already stored in the database."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT EXISTS (SELECT 1 FROM document_chunks LIMIT 1);")
+        exists = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        return exists
+    except Exception as e:
+        print(f"[ERROR] Database check failed: {e}")
+        return False
+
 @app.post("/query")
 async def query_document(request: QueryRequest):
-    mode = processing_status.get("mode")
+    
+    # Check if we have data in memory (Full Context) or in the DB (RAG)
+    has_rag_data = has_stored_data()
+    has_mem_data = len(full_context_pages) > 0
 
-    if mode is None or processing_status.get("status") != "done":
+    if not has_rag_data and not has_mem_data:
         raise HTTPException(
             status_code=400,
-            detail=f"No document ready. Current status: {processing_status.get('status')}",
+            detail="No document data found. Please upload a PDF first."
         )
+    
+    # Determine mode: Memory takes priority if it exists
+    mode = "full_context" if has_mem_data else "rag"
+
+    # if mode is None or processing_status.get("status") != "done":
+    #     raise HTTPException(
+    #         status_code=400,
+    #         detail=f"No document ready. Current status: {processing_status.get('status')}",
+    #     )
 
     if mode == "full_context":
         if not full_context_pages:
@@ -901,7 +948,7 @@ async def query_document(request: QueryRequest):
 
     # Both branches converge here
     base_prompt = f"""You are an assistant that has read a document and answers questions about it.
-Using the context below, answer the question. If you don't know, say so.
+Using the context below, answer the question. If you don't have the context and don't know the answer, say so.
 Return only the answer.
 
 Context:
@@ -923,7 +970,23 @@ Answer:"""
 
 @app.get("/status")
 async def get_status():
-    return processing_status
+
+    # Otherwise, check the DB to see if we are actually 'done' from a previous session
+    # can directly query from db
+    if has_stored_data():
+        return {
+            "status": "done",
+            "mode": "rag",
+            "message": "Existing data found in database. Ready for queries."
+        }
+    if len(full_context_pages) > 0:
+        return {"status": "done", "mode": "full_context"}
+    # If the global status is 'processing', keep returning that
+    if processing_status.get("status") == "processing":
+        return processing_status
+    
+        
+    return {"status": "idle", "message": "No data found."}
 
 
 # /pruning-report endpoint

@@ -1,37 +1,29 @@
-# Use an official NVIDIA CUDA image as the parent image
-# Update the version (12.1.0) based on your specific torch/transformers version
-FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+FROM python:3.11-slim
 
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-
-# Set work directory
 WORKDIR /app
 
-# Install system dependencies
+# System deps: build tools for psycopg2 + pgvector, and libgomp for sentence-transformers
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-pip \
-    python3-dev \
+    gcc \
+    g++ \
     libpq-dev \
-    build-essential \
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements file
+# Install Python deps first (cached layer — only rebuilds if requirements.txt changes)
 COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Python dependencies
-RUN pip3 install --no-cache-dir --upgrade pip && \
-    pip3 install --no-cache-dir -r requirements.txt
+# Download the spaCy English model
+RUN python -m spacy download en_core_web_sm
 
-# Download Spacy model (English)
-RUN python3 -m spacy download en_core_web_sm
+# Copy app code
+COPY main.py .
 
-# Copy the rest of the application code
-COPY . .
+# Pre-download the sentence-transformers model at build time
+# so it's baked into the image and startup is fast
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-mpnet-base-v2')"
 
-# Expose the port FastAPI runs on
-EXPOSE 8000
+EXPOSE 8080
 
-# Command to run the application using uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
