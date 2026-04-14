@@ -14,7 +14,6 @@ from dotenv import load_dotenv
 from typing import Literal, Optional
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
-import json
 
 origins = [
     "https://adaptive-rag.vercel.app/",
