@@ -713,7 +713,7 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
             text_chunks = [item["sentence_chunk"] for item in raw_pages_and_text]
             new_embeddings = embedding_model.encode(
                 text_chunks,
-                batch_size=12,  # up from 32
+                batch_size=8,  # up from 32
                 convert_to_numpy=True,
                 show_progress_bar=True,
             )
