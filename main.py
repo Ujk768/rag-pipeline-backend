@@ -45,6 +45,9 @@ DB_WRITE_BATCH = 100
 # Embedding dimensionality — must match the model loaded below.
 EMBEDDING_DIM = 384
 
+MAX_FILE_SIZE_MB = 5
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+
 DB_CONFIG = {
     "dbname": os.getenv("DB_NAME"),
     "user": os.getenv("DB_USER"),
@@ -709,39 +712,37 @@ async def call_openrouter(prompt: str, temperature: float, max_new_tokens: int) 
 
 # ENDPOINTS
 
+MAX_FILE_SIZE_MB = 5
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+
 @app.post("/upload")
 async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    pruning_strategy: PruningStrategy = Query(
-        default="none",
-        description=(
-            "Pruning strategy to apply before storing embeddings. "
-            "'none': store all chunks (streaming, lowest RAM). "
-            "'cosine': prune chunks too close to centroid. "
-            "'cosine_whitened': cosine pruning on whitened embedding space. "
-            "'kmeans': cluster embeddings, keep one representative per cluster. "
-            "'mmr': iterative selection balancing relevance and diversity."
-        ),
-    ),
+    pruning_strategy: PruningStrategy = Query(default="none"),
 ):
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
     if processing_status.get("status") == "processing":
         raise HTTPException(status_code=409, detail="Already processing a file. Poll /status.")
 
+    contents = await file.read()
+    if len(contents) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum size is {MAX_FILE_SIZE_MB}MB."
+        )
+
     temp_path = f"temp_{file.filename}"
-    with open(temp_path, "wb") as buffer:
-        while chunk := await file.read(1024 * 1024):
-            buffer.write(chunk)
+    with open(temp_path, "wb") as f:
+        f.write(contents)
+    del contents
 
     background_tasks.add_task(process_pdf, temp_path, file.filename, pruning_strategy)
     return {
         "message": "Upload received, processing in background. Poll /status to check.",
         "pruning_strategy": pruning_strategy,
     }
-
-
 def has_stored_data() -> bool:
     try:
         conn = get_db_connection()
