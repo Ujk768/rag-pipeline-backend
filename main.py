@@ -36,7 +36,7 @@ FULL_CONTEXT_TOKEN_LIMIT = 6000
 # Each batch of 16 chunks at 384-dim float32 ≈ 24KB — negligible.
 # Increasing this does not meaningfully speed up encoding; the bottleneck
 # is the transformer forward pass, not data loading.
-ENCODE_BATCH_SIZE = 16
+ENCODE_BATCH_SIZE = 128
 
 # DB write batch: number of rows passed to execute_values per commit.
 # Keeps transaction size small and avoids building a giant in-memory list.
@@ -165,7 +165,7 @@ def iter_chunks(full_text_by_page: list[dict], nlp, slice_size: int = 10):
     """
     count =0 
     page_texts = [p["text"] for p in full_text_by_page]
-    for page_data, doc in zip(full_text_by_page, nlp.pipe(page_texts, batch_size=50)):
+    for page_data, doc in zip(full_text_by_page, nlp.pipe(page_texts, batch_size=100)):
         sentences = [str(s) for s in doc.sents]
         for chunk in split_list(sentences, slice_size):
             joined = "".join(chunk).replace("  ", " ").strip()
@@ -451,7 +451,16 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
         processing_status = {"status": "processing", "chunks": 0, "error": None, "mode": None}
         full_context_pages = []
         pruning_report = {}
-
+        # Clear existing data before processing new document
+        print("[INFO] Clearing existing document data...")
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM document_chunks;")
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("[INFO] Database cleared.")
+        # Process the new PDF
         print(f"[INFO] Opening PDF: {filename}")
         document = fitz.open(file_path)
         total_pages = len(document)
@@ -504,7 +513,7 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
                         texts = [c["sentence_chunk"] for c in batch_chunks]
                         embs = embedding_model.encode(
                             texts, batch_size=ENCODE_BATCH_SIZE,
-                            convert_to_numpy=True, show_progress_bar=True,
+                            convert_to_numpy=True, show_progress_bar=False,
                         )
                         rows = [
                             (c["page_number"], c["sentence_chunk"], embs[j].tolist())
