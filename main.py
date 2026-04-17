@@ -501,7 +501,7 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
                         texts = [c["sentence_chunk"] for c in batch_chunks]
                         embs = embedding_model.encode(
                             texts, batch_size=ENCODE_BATCH_SIZE,
-                            convert_to_numpy=True, show_progress_bar=False,
+                            convert_to_numpy=True, show_progress_bar=True,
                         )
                         rows = [
                             (c["page_number"], c["sentence_chunk"], embs[j].tolist())
