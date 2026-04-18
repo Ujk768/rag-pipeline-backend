@@ -20,7 +20,6 @@ COPY --from=builder /root/.local /root/.local
 COPY main.py .
 # Pre-download model (keep this as a layer)
 
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
 ENV PATH=/root/.local/bin:$PATH
 
 EXPOSE 8080
