@@ -28,8 +28,7 @@ load_dotenv()
 # CONFIGURATION
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 DATA_BASE_URL = os.getenv("DATA_BASE_URL")
-# EMBEDDING_SERVICE_URL = os.getenv("EMBEDDING_SERVICE_URL")
-EMBEDDING_SERVICE_URL = "http://localhost:7000"
+EMBEDDING_SERVICE_URL = os.getenv("EMBEDDING_SERVICE_URL")
 
 FULL_CONTEXT_TOKEN_LIMIT = 6000
 MAX_TOKEN_COUNT = 80000
@@ -93,6 +92,18 @@ full_context_pages: list[dict] = []
 pruning_report: dict = {}
 
 
+# Warm Embedding Service on startup
+def warm_embedding_service():
+    try:
+        with httpx.Client() as client:
+            response = client.get(f"{EMBEDDING_SERVICE_URL}/health", timeout=10.0)
+            if response.status_code == 200:
+                print("[INFO] Embedding service is healthy.")
+            else:
+                print(f"[WARN] Embedding service health check failed with status code: {response.status_code}")
+    except Exception as e:
+        print(f"[ERROR] Failed to connect to embedding service during warm-up: {e}")    
+
 
 # LIFESPAN
 @asynccontextmanager
@@ -100,6 +111,9 @@ async def lifespan(app: FastAPI):
     print("[INFO] Init DB...")
     init_db()
 
+    print("[INFO] Warming up embedding service...")
+    warm_embedding_service()
+    
     global nlp
     print("[INFO] Loading spaCy...")
     nlp = English()
@@ -399,9 +413,13 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
                     pass
 
             processing_status.update({
-                "status": "done", "mode": "rag", "chunks": chunks_stored,
-                "pruning_strategy": pruning_strategy,
-                "pruning_summary": pruning_report.get("summary", {}),
+                "status": "done",
+                "mode": "rag",
+                "chunks": chunks_stored,
+                "pruning_strategy": "none",
+                "pruning_fallback": True,
+                "pruning_fallback_reason": f"Document had {total_chunks} chunks which exceeds the {MAX_CHUNKS} chunk limit for pruning on this machine.",
+                "pruning_summary": pruning_report["summary"],
             })
             print(f"[INFO] Done! {chunks_stored} chunks stored (strategy: {pruning_strategy}).")
 
