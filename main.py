@@ -612,3 +612,7 @@ async def reset_data():
     pruning_report = {}
     processing_status = {"status": "idle", "chunks": 0, "error": None, "mode": None}
     return {"message": "Data reset successfully."}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
