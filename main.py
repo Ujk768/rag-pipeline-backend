@@ -45,8 +45,16 @@ DB_WRITE_BATCH = 100
 # Embedding dimensionality — must match the model loaded below.
 EMBEDDING_DIM = 384
 
-MAX_FILE_SIZE_MB = 5
+# File size limit — 2MB keeps chunk counts safely under ~250
+# on shared-cpu-1x with 1GB RAM
+MAX_FILE_SIZE_MB = 4
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+
+# Hard ceiling on chunks before OOM risk on pruning path.
+# 300 chunks * 384-dim float32 = ~450KB for the matrix alone,
+# but pruning algorithms build intermediates that multiply this.
+# 300 is safe with the model (~300MB) already resident.
+MAX_CHUNKS = 300
 
 DB_CONFIG = {
     "dbname": os.getenv("DB_NAME"),
@@ -65,6 +73,7 @@ def get_db_connection():
     register_vector(conn)
     return conn
 
+
 def init_db():
     conn = psycopg2.connect(DATA_BASE_URL, sslmode="require", connect_timeout=5)
     cur = conn.cursor()
@@ -81,7 +90,7 @@ def init_db():
     """)
     cur.execute("""
         INSERT INTO app_status (key, value)
-        VALUES ('processing_status', '{"status": "idle", "chunks": 0, "error": None, "mode": None}')
+        VALUES ('processing_status', '{"status": "idle", "chunks": 0, "error": null, "mode": null}')
         ON CONFLICT (key) DO NOTHING;
     """)
     cur.execute("""
@@ -103,8 +112,6 @@ processing_status = {"status": "idle", "chunks": 0, "error": None, "mode": None}
 full_context_pages: list[dict] = []
 pruning_report: dict = {}
 
-llm_model = None
-tokenizer = None
 DEVICE = "cpu"
 
 
@@ -172,7 +179,6 @@ def iter_chunks(full_text_by_page: list[dict], nlp, slice_size: int = 10):
             joined = re.sub(r"\.([A-Z])", r". \1", joined)
             if joined:
                 count += 1
-
                 if count % 50 == 0:
                     print(f"[CHUNK GEN] Yielded {count} chunks...")
                 yield {"page_number": page_data["page_number"], "sentence_chunk": joined}
@@ -524,7 +530,7 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
                         del embs, rows
                         batch_chunks = []
 
-                # Flush remaining chunks that didn't fill a full batch
+                # Flush remaining
                 if batch_chunks:
                     texts = [c["sentence_chunk"] for c in batch_chunks]
                     embs = embedding_model.encode(
@@ -562,22 +568,8 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
                 print(f"[INFO] Done! {chunks_stored} chunks stored (streaming, no pruning).")
 
             else:
-                # ----------------------------------------------------------------
-                # PRUNING PATH
-                # Pruning strategies (cosine, kmeans, mmr) need the full embedding
-                # matrix to make decisions. We avoid keeping it in RAM by writing
-                # it to a memory-mapped temp file on disk. numpy.memmap lets the
-                # pruning functions address the array normally while the OS pages
-                # in only the rows that are actually touched.
-                #
-                # Pass 1: materialise chunks as text (small), encode to mmap file.
-                # Pass 2: run pruning on mmap array → kept_indices list.
-                # Pass 3: re-read survivors from mmap, write to DB in batches.
-                # Cleanup: delete temp file.
-                # ----------------------------------------------------------------
                 print(f"[INFO] Pruning path — materialising chunks for strategy: {pruning_strategy}")
 
-                # Materialise chunk metadata (text only — much smaller than floats)
                 raw_pages_and_text = list(iter_chunks(full_text_by_page, nlp))
                 total_chunks = len(raw_pages_and_text)
                 print(f"[INFO] Total chunks: {total_chunks}")
@@ -586,9 +578,52 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
                     processing_status.update({"status": "failed", "error": "No valid chunks after splitting"})
                     return
 
-                # --- Pass 1: encode to memmap ---
+                # Guard against OOM on pruning path — fall back to streaming
+                # if chunk count exceeds safe ceiling for this machine's RAM
+                if total_chunks > MAX_CHUNKS:
+                    print(
+                        f"[WARN] {total_chunks} chunks exceeds MAX_CHUNKS={MAX_CHUNKS} "
+                        f"for pruning on 1GB RAM. Falling back to streaming (no pruning)."
+                    )
+                    pruning_strategy = "none"
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    chunks_stored = 0
+                    for chunk in raw_pages_and_text:
+                        texts = [chunk["sentence_chunk"]]
+                        embs = embedding_model.encode(
+                            texts, batch_size=1,
+                            convert_to_numpy=True, show_progress_bar=False,
+                        )
+                        rows = [(chunk["page_number"], chunk["sentence_chunk"], embs[0].tolist())]
+                        _insert_rows_batched(cur, rows)
+                        chunks_stored += 1
+                        del embs, rows
+                    cur.close()
+                    conn.close()
+                    pruning_report = {
+                        "strategy": "none (fallback — chunk limit exceeded)",
+                        "summary": {
+                            "total_chunks": chunks_stored,
+                            "chunks_kept": chunks_stored,
+                            "chunks_pruned": 0,
+                            "retention_rate_pct": 100.0,
+                            "pruning_rate_pct": 0.0,
+                            "storage_vectors_saved": 0,
+                            "estimated_storage_saved_pct": 0.0,
+                        },
+                    }
+                    processing_status.update({
+                        "status": "done", "mode": "rag", "chunks": chunks_stored,
+                        "pruning_strategy": "none",
+                        "pruning_summary": pruning_report["summary"],
+                    })
+                    print(f"[INFO] Done! {chunks_stored} chunks stored (fallback streaming).")
+                    return
+
+                # Normal pruning path
                 mmap_fd, mmap_path = tempfile.mkstemp(suffix=".npy")
-                os.close(mmap_fd)  # numpy opens it itself
+                os.close(mmap_fd)
 
                 try:
                     mmap_emb = np.memmap(
@@ -610,13 +645,11 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
                     mmap_emb.flush()
                     print("[INFO] Encoding complete, flushed to disk.")
 
-                    # Re-open as read-only for pruning
                     mmap_ro = np.memmap(
                         mmap_path, dtype="float32", mode="r",
                         shape=(total_chunks, EMBEDDING_DIM),
                     )
 
-                    # --- Pass 2: prune ---
                     print(f"[INFO] Applying pruning strategy: {pruning_strategy}")
                     if pruning_strategy == "cosine":
                         kept_indices, report = prune_cosine(mmap_ro, raw_pages_and_text)
@@ -638,28 +671,26 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
                         f"({report['summary'].get('pruning_rate_pct', 0)}% pruned)"
                     )
 
-                    # --- Pass 3: insert survivors in batches ---
                     print("[INFO] Inserting survivors into Postgres...")
                     conn = get_db_connection()
                     cur = conn.cursor()
                     kept_set = set(kept_indices)
-
                     batch_rows: list[tuple] = []
                     chunks_stored = 0
+
                     for i in range(total_chunks):
                         if i not in kept_set:
                             continue
                         batch_rows.append((
                             raw_pages_and_text[i]["page_number"],
                             raw_pages_and_text[i]["sentence_chunk"],
-                            mmap_ro[i].tolist(),  # pages in from disk only when accessed
+                            mmap_ro[i].tolist(),
                         ))
                         if len(batch_rows) >= DB_WRITE_BATCH:
                             _insert_rows_batched(cur, batch_rows)
                             chunks_stored += len(batch_rows)
                             batch_rows = []
 
-                    # Flush remaining
                     if batch_rows:
                         _insert_rows_batched(cur, batch_rows)
                         chunks_stored += len(batch_rows)
@@ -668,7 +699,6 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
                     conn.close()
 
                 finally:
-                    # Always clean up the temp file, even if something raised
                     try:
                         os.unlink(mmap_path)
                     except OSError:
@@ -712,7 +742,6 @@ async def call_openrouter(prompt: str, temperature: float, max_new_tokens: int) 
                 print(f"[ERROR] LLM API Failed: {error_msg}")
                 return f"LLM Error: {error_msg}"
             data = response.json()
-            print(data)
             return data["choices"][0]["message"]["content"]
         except Exception as e:
             print(f"[CRITICAL] LLM Call Crashed: {e}")
@@ -721,14 +750,21 @@ async def call_openrouter(prompt: str, temperature: float, max_new_tokens: int) 
 
 # ENDPOINTS
 
-MAX_FILE_SIZE_MB = 5
-MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
-
 @app.post("/upload")
 async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    pruning_strategy: PruningStrategy = Query(default="none"),
+    pruning_strategy: PruningStrategy = Query(
+        default="none",
+        description=(
+            "Pruning strategy to apply before storing embeddings. "
+            "'none': store all chunks (streaming, lowest RAM). "
+            "'cosine': prune chunks too close to centroid. "
+            "'cosine_whitened': cosine pruning on whitened embedding space. "
+            "'kmeans': cluster embeddings, keep one representative per cluster. "
+            "'mmr': iterative selection balancing relevance and diversity."
+        ),
+    ),
 ):
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
@@ -837,8 +873,16 @@ Answer:"""
 
 @app.get("/status")
 async def get_status():
-    if processing_status.get("status") == "processing":
+    current = processing_status.get("status")
+
+    if current == "processing":
         return processing_status
+    if current == "failed":
+        return processing_status
+    if current == "done":
+        return processing_status
+
+    # Only reach here on idle — e.g. after a cold restart
     if has_stored_data():
         return {"status": "done", "mode": "rag", "message": "Existing data found in database. Ready for queries."}
     if len(full_context_pages) > 0:
