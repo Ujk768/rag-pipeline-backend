@@ -36,7 +36,7 @@ FULL_CONTEXT_TOKEN_LIMIT = 6000
 # Each batch of 16 chunks at 384-dim float32 ≈ 24KB — negligible.
 # Increasing this does not meaningfully speed up encoding; the bottleneck
 # is the transformer forward pass, not data loading.
-ENCODE_BATCH_SIZE = 128
+ENCODE_BATCH_SIZE = 16
 
 # DB write batch: number of rows passed to execute_values per commit.
 # Keeps transaction size small and avoids building a giant in-memory list.
@@ -172,7 +172,7 @@ def iter_chunks(full_text_by_page: list[dict], nlp, slice_size: int = 10):
     """
     count =0 
     page_texts = [p["text"] for p in full_text_by_page]
-    for page_data, doc in zip(full_text_by_page, nlp.pipe(page_texts, batch_size=100)):
+    for page_data, doc in zip(full_text_by_page, nlp.pipe(page_texts, batch_size=16)):
         sentences = [str(s) for s in doc.sents]
         for chunk in split_list(sentences, slice_size):
             joined = "".join(chunk).replace("  ", " ").strip()
