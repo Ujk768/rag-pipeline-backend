@@ -36,9 +36,9 @@ MAX_TOKEN_COUNT = 80000
 # With embedding offloaded, encode batch size only affects
 # how many texts we send per HTTP request to the embedding service.
 # 64 is a good balance — not too large to timeout, not too small to be chatty.
-ENCODE_BATCH_SIZE = 64
+ENCODE_BATCH_SIZE = 128
 DB_WRITE_BATCH = 100
-EMBEDDING_DIM = 384
+EMBEDDING_DIM = 768
 
 MAX_FILE_SIZE_MB = 4
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
@@ -77,7 +77,7 @@ def init_db():
             id           SERIAL PRIMARY KEY,
             page_number  INTEGER,
             content      TEXT,
-            embedding    vector(384)
+            embedding    vector(768)
         );
     """)
     conn.commit()
@@ -156,7 +156,7 @@ def embed_texts(texts: list[str]) -> np.ndarray:
                 response = client.post(
                     f"{EMBEDDING_SERVICE_URL}/embed",
                     json={"texts": texts},
-                    timeout=60.0,
+                    timeout=120.0,
                 )
                 response.raise_for_status()
                 return np.array(response.json()["embeddings"])
@@ -175,7 +175,7 @@ def split_list(input_list: list[str], slice_size: int = 10) -> list[list[str]]:
 def iter_chunks(full_text_by_page: list[dict], nlp, slice_size: int = 10):
     count = 0
     page_texts = [p["text"] for p in full_text_by_page]
-    for page_data, doc in zip(full_text_by_page, nlp.pipe(page_texts, batch_size=16)):
+    for page_data, doc in zip(full_text_by_page, nlp.pipe(page_texts, batch_size=50)):
         sentences = [str(s) for s in doc.sents]
         for chunk in split_list(sentences, slice_size):
             joined = "".join(chunk).replace("  ", " ").strip()
