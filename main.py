@@ -34,6 +34,7 @@ MAX_TOKEN_COUNT = 80000
 # how many texts we send per HTTP request to the embedding service.
 # 64 is a good balance — not too large to timeout, not too small to be chatty.
 ENCODE_BATCH_SIZE = int(os.getenv("ENCODE_BATCH_SIZE", 64))
+DB_WRITE_BATCH = int(os.getenv("DB_WRITE_BATCH", 100))
 
 EMBEDDING_DIM = 384
 
