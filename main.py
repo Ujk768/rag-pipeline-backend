@@ -2,20 +2,19 @@ import os
 import re
 import fitz  # PyMuPDF
 import numpy as np
-import psycopg2
 import tempfile
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from spacy.lang.en import English
-from pgvector.psycopg2 import register_vector
-from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 from typing import Literal
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
-import time
-from prune import prune_cosine, prune_cosine_whitened, prune_kmeans, prune_mmr, compute_whitening_matrix, _build_pruning_stats, maxsim_rerank
+from prune import prune_cosine, prune_cosine_whitened, prune_kmeans, prune_mmr, maxsim_rerank
+from embedding import embed_texts, warm_embedding_service
+from db import clear_existing_data, get_db_connection, has_stored_data, init_db, _insert_rows_batched
+
 
 origins = [
     "https://adaptive-rag.vercel.app/",
@@ -27,8 +26,6 @@ load_dotenv()
 
 # CONFIGURATION
 LLM_API_KEY = os.getenv("LLM_API_KEY")
-DATA_BASE_URL = os.getenv("DATA_BASE_URL")
-EMBEDDING_SERVICE_URL = os.getenv("EMBEDDING_SERVICE_URL")
 
 FULL_CONTEXT_TOKEN_LIMIT = 6000
 MAX_TOKEN_COUNT = 80000
@@ -36,9 +33,9 @@ MAX_TOKEN_COUNT = 80000
 # With embedding offloaded, encode batch size only affects
 # how many texts we send per HTTP request to the embedding service.
 # 64 is a good balance — not too large to timeout, not too small to be chatty.
-ENCODE_BATCH_SIZE = 128
-DB_WRITE_BATCH = 100
-EMBEDDING_DIM = 768
+ENCODE_BATCH_SIZE = int(os.getenv("ENCODE_BATCH_SIZE", 64))
+
+EMBEDDING_DIM = 384
 
 MAX_FILE_SIZE_MB = 4
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
@@ -46,63 +43,12 @@ MAX_CHUNKS = 300
 
 PruningStrategy = Literal["none", "cosine", "cosine_whitened", "kmeans", "mmr"]
 
-# DATABASE
-def get_db_connection():
-    conn = psycopg2.connect(DATA_BASE_URL, sslmode="require", connect_timeout=5)
-    register_vector(conn)
-    return conn
-
-
-def init_db():
-    conn = psycopg2.connect(DATA_BASE_URL, sslmode="require", connect_timeout=5)
-    cur = conn.cursor()
-    cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-    conn.commit()
-    register_vector(conn)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS app_status (
-            id SERIAL PRIMARY KEY,
-            key TEXT UNIQUE,
-            value TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    cur.execute("""
-        INSERT INTO app_status (key, value)
-        VALUES ('processing_status', '{"status": "idle", "chunks": 0, "error": null, "mode": null}')
-        ON CONFLICT (key) DO NOTHING;
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS document_chunks (
-            id           SERIAL PRIMARY KEY,
-            page_number  INTEGER,
-            content      TEXT,
-            embedding    vector(768)
-        );
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
-    print("[INFO] Database initialized.")
-
-
 # GLOBAL STATE
 processing_status = {"status": "idle", "chunks": 0, "error": None, "mode": None}
 full_context_pages: list[dict] = []
 pruning_report: dict = {}
 
 
-# Warm Embedding Service on startup
-def warm_embedding_service():
-    try:
-        with httpx.Client() as client:
-            response = client.get(f"{EMBEDDING_SERVICE_URL}/health", timeout=10.0)
-            if response.status_code == 200:
-                print("[INFO] Embedding service is healthy.")
-            else:
-                print(f"[WARN] Embedding service health check failed with status code: {response.status_code}")
-    except Exception as e:
-        print(f"[ERROR] Failed to connect to embedding service during warm-up: {e}")    
 
 
 # LIFESPAN
@@ -143,28 +89,6 @@ class QueryRequest(BaseModel):
     use_maxsim: bool = False
 
 
-# EMBEDDING CLIENT
-# Calls the dedicated embedding service instead of running a local model.
-# Retries on transient failures with a short backoff.
-def embed_texts(texts: list[str]) -> np.ndarray:
-    print(f"[INFO] Requesting embeddings for {len(texts)} texts from embedding service...")
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            print(f"[INFO] Embedding service request (attempt {attempt + 1}/{max_retries})...")
-            with httpx.Client() as client:
-                response = client.post(
-                    f"{EMBEDDING_SERVICE_URL}/embed",
-                    json={"texts": texts},
-                    timeout=120.0,
-                )
-                response.raise_for_status()
-                return np.array(response.json()["embeddings"])
-        except httpx.HTTPError as e:
-            if attempt == max_retries - 1:
-                raise RuntimeError(f"Embedding service failed after {max_retries} attempts: {e}")
-            print(f"[WARN] Embedding service error (attempt {attempt + 1}/{max_retries}): {e}")
-            time.sleep(2 ** attempt)  # exponential backoff: 1s, 2s, 4s
 
 
 # HELPER FUNCTIONS
@@ -186,15 +110,6 @@ def iter_chunks(full_text_by_page: list[dict], nlp, slice_size: int = 10):
                     print(f"[CHUNK GEN] Yielded {count} chunks...")
                 yield {"page_number": page_data["page_number"], "sentence_chunk": joined}
 
-# PDF PROCESSING
-def _insert_rows_batched(cur, rows: list[tuple], batch_size: int = DB_WRITE_BATCH):
-    for i in range(0, len(rows), batch_size):
-        execute_values(
-            cur,
-            "INSERT INTO document_chunks (page_number, content, embedding) VALUES %s",
-            rows[i:i + batch_size],
-        )
-        cur.connection.commit()
 
 
 def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
@@ -206,14 +121,7 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
         pruning_report = {}
 
         # Clear existing data
-        print("[INFO] Clearing existing document data...")
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM document_chunks;")
-        conn.commit()
-        cur.close()
-        conn.close()
-        print("[INFO] Database cleared.")
+        clear_existing_data()
 
         print(f"[INFO] Opening PDF: {filename}")
         document = fitz.open(file_path)
@@ -456,20 +364,6 @@ async def call_openrouter(prompt: str, temperature: float, max_new_tokens: int) 
 
 
 # ENDPOINTS
-def has_stored_data() -> bool:
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT EXISTS (SELECT 1 FROM document_chunks LIMIT 1);")
-        exists = cur.fetchone()[0]
-        cur.close()
-        conn.close()
-        return exists
-    except Exception as e:
-        print(f"[ERROR] Database check failed: {e}")
-        return False
-
-
 @app.post("/upload")
 async def upload_document(
     background_tasks: BackgroundTasks,

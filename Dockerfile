@@ -19,6 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /root/.local /root/.local
 COPY main.py .
 COPY prune.py .
+COPY embedding.py .
+COPY db.py .
 # Pre-download model (keep this as a layer)
 
 ENV PATH=/root/.local/bin:$PATH
