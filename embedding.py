@@ -3,7 +3,6 @@ import asyncio
 import httpx
 import numpy as np
 import time
-from google import genai
 import os
 import voyageai
 from dotenv import load_dotenv
@@ -51,16 +50,6 @@ def embed_texts(texts: list[str]) -> np.ndarray:
                 raise RuntimeError(f"Embedding service failed after {max_retries} attempts: {e}")
             print(f"[WARN] Embedding service error (attempt {attempt + 1}/{max_retries}): {e}")
             time.sleep(2 ** attempt)  # exponential backoff: 1s, 2s, 4s
-
-
-async def _embed_texts_async(texts: list[str]) -> np.ndarray:
-    client = genai.Client(api_key=GEMINI_EMBEDDING_API_KEY)  # no await
-    result = await client.aio.models.embed_content(
-        model="gemini-embedding-001",
-        contents=texts
-    )
-    embeddings = [e.values for e in result.embeddings]
-    return np.array(embeddings)
 
 async def _embed_texts_vector_async(texts: list[str]) -> np.ndarray:
     vo = voyageai.Client(api_key=os.getenv("VOYAGE_API_KEY"))
