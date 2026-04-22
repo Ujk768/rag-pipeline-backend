@@ -14,7 +14,7 @@ from typing import Literal
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from prune import prune_cosine, prune_cosine_whitened, prune_kmeans, prune_mmr, maxsim_rerank
-from embedding import embedding_text, warm_embedding_service
+from embedding import embedding_text
 from db import clear_existing_data, clear_pruned_chunks, count_active_chunks_from_pruned, get_db_connection, get_document_info, has_pruned_data, has_stored_data, init_db, _insert_rows_batched, insert_pruned_rows_batched, upsert_document_info
 
 
@@ -59,10 +59,6 @@ pruning_report: dict = {}
 async def lifespan(app: FastAPI):
     print("[INFO] Init DB...")
     init_db()
-
-    print("[INFO] Warming up embedding service...")
-    warm_embedding_service()
-    
     global nlp
     print("[INFO] Loading spaCy...")
     nlp = English()
