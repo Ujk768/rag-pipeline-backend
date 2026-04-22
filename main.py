@@ -87,6 +87,7 @@ app.add_middleware(
 # REQUEST SCHEMAS
 class QueryRequest(BaseModel):
     query: str
+    prunning_stratergy: str = "none"
     temperature: float = 0.7
     max_new_tokens: int = 256
     use_maxsim: bool = False
@@ -280,7 +281,8 @@ async def query_document(request: QueryRequest):
         fetch_limit = 20 if request.use_maxsim else 5
 
         # Route to pruned table if a pruning run exists, otherwise use main table
-        table = "document_chunks_pruned" if has_pruned_data() else "document_chunks"
+        # table = "document_chunks_pruned" if has_pruned_data() else "document_chunks"
+        table = "document_chunks" if request.prunning_stratergy.strip().lower() == "none" else "document_chunks_pruned"
         cur.execute(f"""
             SELECT page_number, content, embedding
             FROM {table}
@@ -439,7 +441,7 @@ async def _apply_pruning_to_existing(strategy: str) -> dict:
 
 @app.post("/prune")
 async def prune_existing(
-    pruning_strategy: PruningStrategy = Query(default="cosine"),
+    pruning_strategy: PruningStrategy = Query(),
 ):
     """Re-prune the vectors already stored in the DB — no re-embedding needed."""
     if pruning_strategy == "none":
