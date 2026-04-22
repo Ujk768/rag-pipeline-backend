@@ -1,3 +1,5 @@
+import asyncio
+from functools import partial
 import os
 import re
 import fitz  # PyMuPDF
@@ -12,8 +14,8 @@ from typing import Literal
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from prune import prune_cosine, prune_cosine_whitened, prune_kmeans, prune_mmr, maxsim_rerank
-from embedding import embed_texts, warm_embedding_service
-from db import clear_existing_data, get_db_connection, has_stored_data, init_db, _insert_rows_batched
+from embedding import embedding_text, warm_embedding_service
+from db import clear_existing_data, clear_pruned_chunks, count_active_chunks_from_pruned, get_db_connection, get_document_info, has_pruned_data, has_stored_data, init_db, _insert_rows_batched, insert_pruned_rows_batched, upsert_document_info
 
 
 origins = [
@@ -28,7 +30,7 @@ load_dotenv()
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 
 FULL_CONTEXT_TOKEN_LIMIT = 6000
-MAX_TOKEN_COUNT = 80000
+# MAX_TOKEN_COUNT = 80000
 
 # With embedding offloaded, encode batch size only affects
 # how many texts we send per HTTP request to the embedding service.
@@ -36,7 +38,7 @@ MAX_TOKEN_COUNT = 80000
 ENCODE_BATCH_SIZE = int(os.getenv("ENCODE_BATCH_SIZE", 64))
 DB_WRITE_BATCH = int(os.getenv("DB_WRITE_BATCH", 100))
 
-EMBEDDING_DIM = 384
+EMBEDDING_DIM = 1024
 
 MAX_FILE_SIZE_MB = 4
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
@@ -113,20 +115,19 @@ def iter_chunks(full_text_by_page: list[dict], nlp, slice_size: int = 10):
 
 
 
-def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
+def process_pdf(file_path: str, filename: str):
     global processing_status, full_context_pages, pruning_report
 
     try:
         processing_status = {"status": "processing", "chunks": 0, "error": None, "mode": None}
         full_context_pages = []
-        pruning_report = {}
-
         # Clear existing data
         clear_existing_data()
 
         print(f"[INFO] Opening PDF: {filename}")
         document = fitz.open(file_path)
         total_pages = len(document)
+        upsert_document_info(filename, total_pages) 
         print(f"[INFO] PDF has {total_pages} pages")
 
         full_text_by_page = []
@@ -157,180 +158,49 @@ def process_pdf(file_path: str, filename: str, pruning_strategy: str = "none"):
         # RAG MODE
         print("[INFO] Using RAG mode.")
 
-        if pruning_strategy == "none":
-            print("[INFO] Streaming encode + insert (no pruning).")
-            conn = get_db_connection()
-            cur = conn.cursor()
-            chunks_stored = 0
-            batch_chunks: list[dict] = []
+        
+        print("[INFO] Streaming encode + insert (no pruning).")
+        conn = get_db_connection()
+        chunks_stored = 0
+        batch_chunks: list[dict] = []
 
-            for chunk in iter_chunks(full_text_by_page, nlp):
-                batch_chunks.append(chunk)
-                if len(batch_chunks) >= ENCODE_BATCH_SIZE:
-                    texts = [c["sentence_chunk"] for c in batch_chunks]
-                    embs = embed_texts(texts)
-                    rows = [(c["page_number"], c["sentence_chunk"], embs[j].tolist())
-                            for j, c in enumerate(batch_chunks)]
-                    _insert_rows_batched(cur, rows)
-                    chunks_stored += len(rows)
-                    del embs, rows
-                    batch_chunks = []
-
-            if batch_chunks:
+        for chunk in iter_chunks(full_text_by_page, nlp):
+            batch_chunks.append(chunk)
+            if len(batch_chunks) >= ENCODE_BATCH_SIZE:
                 texts = [c["sentence_chunk"] for c in batch_chunks]
-                embs = embed_texts(texts)
+                embs = embedding_text(texts)
                 rows = [(c["page_number"], c["sentence_chunk"], embs[j].tolist())
-                        for j, c in enumerate(batch_chunks)]
-                _insert_rows_batched(cur, rows)
+                    for j, c in enumerate(batch_chunks)]
+                _insert_rows_batched(conn, rows)   # pass conn, not cur
                 chunks_stored += len(rows)
                 del embs, rows
+                batch_chunks = []
 
-            cur.close()
-            conn.close()
+        if batch_chunks:
+            texts = [c["sentence_chunk"] for c in batch_chunks]
+            embs = embedding_text(texts)
+            rows = [(c["page_number"], c["sentence_chunk"], embs[j].tolist())
+                for j, c in enumerate(batch_chunks)]
+            _insert_rows_batched(conn, rows)       # pass conn, not cur
+            chunks_stored += len(rows)
+            del embs, rows
+        
+        conn.close()
 
-            pruning_report = {
-                "strategy": "none",
-                "summary": {
-                    "total_chunks": chunks_stored, "chunks_kept": chunks_stored,
-                    "chunks_pruned": 0, "retention_rate_pct": 100.0,
-                    "pruning_rate_pct": 0.0, "storage_vectors_saved": 0,
-                    "estimated_storage_saved_pct": 0.0,
-                },
-            }
-            processing_status.update({
+        pruning_report = {
+            "strategy": "none",
+            "summary": {
+                "total_chunks": chunks_stored, "chunks_kept": chunks_stored,
+                "chunks_pruned": 0, "retention_rate_pct": 100.0,
+                "pruning_rate_pct": 0.0, "storage_vectors_saved": 0,
+                "estimated_storage_saved_pct": 0.0,
+            },
+        }
+        processing_status.update({
                 "status": "done", "mode": "rag", "chunks": chunks_stored,
                 "pruning_strategy": "none", "pruning_summary": pruning_report["summary"],
-            })
-            print(f"[INFO] Done! {chunks_stored} chunks stored (streaming).")
-
-        else:
-            print(f"[INFO] Pruning path — strategy: {pruning_strategy}")
-            raw_pages_and_text = list(iter_chunks(full_text_by_page, nlp))
-            total_chunks = len(raw_pages_and_text)
-            print(f"[INFO] Total chunks: {total_chunks}")
-
-            if total_chunks == 0:
-                processing_status.update({"status": "failed", "error": "No valid chunks after splitting"})
-                return
-
-            # Fall back to streaming if chunk count is too high for pruning
-            if total_chunks > MAX_CHUNKS:
-                print(f"[WARN] {total_chunks} chunks exceeds MAX_CHUNKS={MAX_CHUNKS}, falling back to streaming.")
-                conn = get_db_connection()
-                cur = conn.cursor()
-                chunks_stored = 0
-                batch_chunks = []
-                for chunk in raw_pages_and_text:
-                    batch_chunks.append(chunk)
-                    if len(batch_chunks) >= ENCODE_BATCH_SIZE:
-                        texts = [c["sentence_chunk"] for c in batch_chunks]
-                        embs = embed_texts(texts)
-                        rows = [(c["page_number"], c["sentence_chunk"], embs[j].tolist())
-                                for j, c in enumerate(batch_chunks)]
-                        _insert_rows_batched(cur, rows)
-                        chunks_stored += len(rows)
-                        del embs, rows
-                        batch_chunks = []
-                if batch_chunks:
-                    texts = [c["sentence_chunk"] for c in batch_chunks]
-                    embs = embed_texts(texts)
-                    rows = [(c["page_number"], c["sentence_chunk"], embs[j].tolist())
-                            for j, c in enumerate(batch_chunks)]
-                    _insert_rows_batched(cur, rows)
-                    chunks_stored += len(rows)
-                cur.close()
-                conn.close()
-                pruning_report = {
-                    "strategy": "none (fallback — chunk limit exceeded)",
-                    "summary": {"total_chunks": chunks_stored, "chunks_kept": chunks_stored,
-                                "chunks_pruned": 0, "retention_rate_pct": 100.0,
-                                "pruning_rate_pct": 0.0, "storage_vectors_saved": 0,
-                                "estimated_storage_saved_pct": 0.0},
-                }
-                processing_status.update({
-                    "status": "done", "mode": "rag", "chunks": chunks_stored,
-                    "pruning_strategy": "none", "pruning_summary": pruning_report["summary"],
-                })
-                print(f"[INFO] Done! {chunks_stored} chunks stored (fallback streaming).")
-                return
-
-            # Encode all chunks to memmap via embedding service
-            mmap_fd, mmap_path = tempfile.mkstemp(suffix=".npy")
-            os.close(mmap_fd)
-
-            try:
-                mmap_emb = np.memmap(mmap_path, dtype="float32", mode="w+",
-                                     shape=(total_chunks, EMBEDDING_DIM))
-                print(f"[INFO] Encoding {total_chunks} chunks via embedding service...")
-                for i in range(0, total_chunks, ENCODE_BATCH_SIZE):
-                    batch_texts = [raw_pages_and_text[j]["sentence_chunk"]
-                                   for j in range(i, min(i + ENCODE_BATCH_SIZE, total_chunks))]
-                    batch_embs = embed_texts(batch_texts)
-                    mmap_emb[i:i + len(batch_texts)] = batch_embs
-                    del batch_embs
-                mmap_emb.flush()
-                print("[INFO] Encoding complete.")
-
-                mmap_ro = np.memmap(mmap_path, dtype="float32", mode="r",
-                                    shape=(total_chunks, EMBEDDING_DIM))
-
-                print(f"[INFO] Applying pruning: {pruning_strategy}")
-                if pruning_strategy == "cosine":
-                    kept_indices, report = prune_cosine(mmap_ro, raw_pages_and_text)
-                elif pruning_strategy == "cosine_whitened":
-                    kept_indices, report = prune_cosine_whitened(mmap_ro, raw_pages_and_text)
-                elif pruning_strategy == "kmeans":
-                    kept_indices, report = prune_kmeans(mmap_ro, raw_pages_and_text)
-                elif pruning_strategy == "mmr":
-                    kept_indices, report = prune_mmr(mmap_ro, raw_pages_and_text)
-                else:
-                    kept_indices = list(range(total_chunks))
-                    report = {"strategy": "none", "summary": {"total_chunks": total_chunks}}
-
-                pruning_report = report
-                print(f"[INFO] Pruning done — kept {len(kept_indices)}/{total_chunks} chunks")
-
-                conn = get_db_connection()
-                cur = conn.cursor()
-                kept_set = set(kept_indices)
-                batch_rows, chunks_stored = [], 0
-
-                for i in range(total_chunks):
-                    if i not in kept_set:
-                        continue
-                    batch_rows.append((
-                        raw_pages_and_text[i]["page_number"],
-                        raw_pages_and_text[i]["sentence_chunk"],
-                        mmap_ro[i].tolist(),
-                    ))
-                    if len(batch_rows) >= DB_WRITE_BATCH:
-                        _insert_rows_batched(cur, batch_rows)
-                        chunks_stored += len(batch_rows)
-                        batch_rows = []
-
-                if batch_rows:
-                    _insert_rows_batched(cur, batch_rows)
-                    chunks_stored += len(batch_rows)
-
-                cur.close()
-                conn.close()
-
-            finally:
-                try:
-                    os.unlink(mmap_path)
-                except OSError:
-                    pass
-
-            processing_status.update({
-                "status": "done",
-                "mode": "rag",
-                "chunks": chunks_stored,
-                "pruning_strategy": "none",
-                "pruning_fallback": True,
-                "pruning_fallback_reason": f"Document had {total_chunks} chunks which exceeds the {MAX_CHUNKS} chunk limit for pruning on this machine.",
-                "pruning_summary": pruning_report["summary"],
-            })
-            print(f"[INFO] Done! {chunks_stored} chunks stored (strategy: {pruning_strategy}).")
+        })
+        print(f"[INFO] Done! {chunks_stored} chunks stored (streaming).")
 
     except Exception as e:
         print(f"[ERROR] Failed to process PDF: {e}")
@@ -369,7 +239,6 @@ async def call_openrouter(prompt: str, temperature: float, max_new_tokens: int) 
 async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    pruning_strategy: PruningStrategy = Query(default="none"),
 ):
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
@@ -385,8 +254,8 @@ async def upload_document(
         f.write(contents)
     del contents
 
-    background_tasks.add_task(process_pdf, temp_path, file.filename, pruning_strategy)
-    return {"message": "Upload received, processing in background. Poll /status.", "pruning_strategy": pruning_strategy}
+    background_tasks.add_task(process_pdf, temp_path, file.filename)
+    return {"message": "Upload received, processing in background. Poll /status."}
 
 
 @app.post("/query")
@@ -403,17 +272,22 @@ async def query_document(request: QueryRequest):
         context_text = "\n\n".join(f"[Page {p['page_number']}]\n{p['text']}" for p in full_context_pages)
         rows = [(p["page_number"], p["text"]) for p in full_context_pages]
     else:
-        # embed_texts is sync — fine here since query is a single short string
-        query_embedding = embed_texts([request.query])[0]
+        loop = asyncio.get_event_loop()
+        query_embedding = (await loop.run_in_executor(None, partial(embedding_text, [request.query])))[0]
+
         conn = get_db_connection()
         cur = conn.cursor()
         fetch_limit = 20 if request.use_maxsim else 5
-        cur.execute("""
+
+        # Route to pruned table if a pruning run exists, otherwise use main table
+        table = "document_chunks_pruned" if has_pruned_data() else "document_chunks"
+        cur.execute(f"""
             SELECT page_number, content, embedding
-            FROM document_chunks
+            FROM {table}
             ORDER BY embedding <=> %s
             LIMIT %s
         """, (query_embedding, fetch_limit))
+
         raw_rows = cur.fetchall()
         cur.close()
         conn.close()
@@ -445,10 +319,10 @@ Answer:"""
         "query": request.query,
         "answer": clean_answer,
         "mode": mode,
+        "serving_from": table if mode == "rag" else "full_context",
         "maxsim_applied": request.use_maxsim and mode == "rag",
         "sources": [{"page": row[0], "text": row[1][:100] + "..."} for row in rows],
     }
-
 
 @app.get("/status")
 async def get_status():
@@ -491,6 +365,109 @@ async def get_stored_chunks(limit: int = Query(default=20, ge=1, le=200)):
         "mode": "rag", "total": total,
         "chunks": [{"id": int(r[0]), "page_number": int(r[1]), "content": r[2],
                     "embedding": [float(v) for v in r[3]]} for r in rows],
+    }
+
+async def _apply_pruning_to_existing(strategy: str) -> dict:
+    """
+    Always reads from document_chunks (full set), applies pruning,
+    then replaces document_chunks_pruned entirely.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Always pull from the immutable source table
+    cur.execute("SELECT id, page_number, content, embedding FROM document_chunks ORDER BY id;")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    if not rows:
+        raise HTTPException(status_code=400, detail="No stored chunks found. Upload a document first.")
+
+    ids          = [r[0] for r in rows]
+    raw_chunks   = [{"page_number": r[1], "sentence_chunk": r[2]} for r in rows]
+    total_chunks = len(rows)
+
+    mmap_fd, mmap_path = tempfile.mkstemp(suffix=".npy")
+    os.close(mmap_fd)
+    try:
+        mmap_emb = np.memmap(mmap_path, dtype="float32", mode="w+",
+                             shape=(total_chunks, EMBEDDING_DIM))
+        for i, r in enumerate(rows):
+            mmap_emb[i] = np.array(r[3], dtype="float32")
+        mmap_emb.flush()
+        mmap_ro = np.memmap(mmap_path, dtype="float32", mode="r",
+                            shape=(total_chunks, EMBEDDING_DIM))
+
+        if strategy == "cosine":
+            kept_indices, report = prune_cosine(mmap_ro, raw_chunks)
+        elif strategy == "cosine_whitened":
+            kept_indices, report = prune_cosine_whitened(mmap_ro, raw_chunks)
+        elif strategy == "kmeans":
+            kept_indices, report = prune_kmeans(mmap_ro, raw_chunks)
+        elif strategy == "mmr":
+            kept_indices, report = prune_mmr(mmap_ro, raw_chunks)
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown strategy '{strategy}'.")
+
+        # Replace pruned table entirely
+        clear_pruned_chunks()
+
+        conn = get_db_connection()
+        batch = [
+            (
+                ids[i],                        # source_chunk_id
+                raw_chunks[i]["page_number"],
+                raw_chunks[i]["sentence_chunk"],
+                mmap_ro[i].tolist(),
+                strategy,
+            )
+            for i in kept_indices
+        ]
+        insert_pruned_rows_batched(conn, batch)
+        conn.close()
+
+    finally:
+        try:
+            os.unlink(mmap_path)
+        except OSError:
+            pass
+
+    global pruning_report
+    pruning_report = report
+    return report
+
+
+@app.post("/prune")
+async def prune_existing(
+    pruning_strategy: PruningStrategy = Query(default="cosine"),
+):
+    """Re-prune the vectors already stored in the DB — no re-embedding needed."""
+    if pruning_strategy == "none":
+        raise HTTPException(status_code=400, detail="Specify a real pruning strategy (cosine, cosine_whitened, kmeans, mmr).")
+    if processing_status.get("status") == "processing":
+        raise HTTPException(status_code=409, detail="A document is currently being processed. Try again after /status returns 'done'.")
+    if not has_stored_data():
+        raise HTTPException(status_code=400, detail="No stored chunks found. Upload a document first.")
+
+    report = await _apply_pruning_to_existing(pruning_strategy)
+    return {"message": f"Pruning complete using strategy '{pruning_strategy}'.", "report": report}
+
+@app.get("/document")
+async def get_document_info_route():
+    info = get_document_info()
+    has_full_ctx = len(full_context_pages) > 0
+    has_rag = has_stored_data()
+
+    if not info and not has_full_ctx and not has_rag:
+        return {"has_document": False}
+
+    return {
+        "has_document":  True,
+        "document_name": info["document_name"] if info else None,
+        "total_pages":   info["total_pages"]   if info else None,
+        "uploaded_at":   info["uploaded_at"]   if info else None,
+        "mode":          "full_context" if has_full_ctx else "rag",
+        "active_chunks": len(full_context_pages) if has_full_ctx else count_active_chunks_from_pruned(),
     }
 
 

@@ -5,12 +5,14 @@ import numpy as np
 import time
 from google import genai
 import os
+import voyageai
 from dotenv import load_dotenv
+
 
 load_dotenv()
 
 EMBEDDING_SERVICE_URL = os.getenv("EMBEDDING_SERVICE_URL")
-GEMINI_EMBEDDING_API_KEY = os.getenv("GEMINI_EMBEDDING_API_KEY")
+VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
 
 
 # Warm Embedding Service on startup
@@ -60,10 +62,34 @@ async def _embed_texts_async(texts: list[str]) -> np.ndarray:
     embeddings = [e.values for e in result.embeddings]
     return np.array(embeddings)
 
+async def _embed_texts_vector_async(texts: list[str]) -> np.ndarray:
+    vo = voyageai.Client(api_key=os.getenv("VOYAGE_API_KEY"))
+    results = []
+    for i in range(0, len(texts), 128):
+        batch = texts[i:i+128]
+        try:
+            result = vo.embed(batch, model="voyage-4-lite", input_type="document")
+            results.extend(result.embeddings)
+        except Exception as e:
+            raise RuntimeError(f"Voyage embedding failed: {e}")
+    return np.array(results)
+
+# def embedding_text(texts: list[str]) -> np.ndarray:
+#     try:
+#         return asyncio.run(_embed_texts_vector_async(texts))
+#     except Exception as e:
+#         print(f"[ERROR] Failed to get embeddings from Gemini API: {e}")
+#         raise RuntimeError("Embedding service is currently unavailable.")
 
 def embedding_text(texts: list[str]) -> np.ndarray:
-    try:
-        return asyncio.run(_embed_texts_async(texts))
-    except Exception as e:
-        print(f"[ERROR] Failed to get embeddings from Gemini API: {e}")
-        raise RuntimeError("Embedding service is currently unavailable.")
+    """Synchronous Voyage embedding — safe to call from both sync and async contexts."""
+    vo = voyageai.Client(api_key=VOYAGE_API_KEY)
+    results = []
+    for i in range(0, len(texts), 128):
+        batch = texts[i:i + 128]
+        try:
+            result = vo.embed(batch, model="voyage-4-lite", input_type="document")
+            results.extend(result.embeddings)
+        except Exception as e:
+            raise RuntimeError(f"Voyage embedding failed: {e}")
+    return np.array(results)
